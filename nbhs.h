@@ -30,17 +30,6 @@
 
 #include "ebr.h"
 
-// personal debooging stuff
-#define NBHS__DEBOOGING 0
-
-#if NBHS__DEBOOGING
-#define NBHS__BEGIN(name)      spall_auto_buffer_begin(name, sizeof(name) - 1, NULL, 0)
-#define NBHS__END()            spall_auto_buffer_end()
-#else
-#define NBHS__BEGIN(name)
-#define NBHS__END()
-#endif
-
 enum {
     NBHS_LOAD_FACTOR = 75,
     NBHS_MOVE_AMOUNT = 128,
@@ -351,7 +340,7 @@ NBHS_Table* NBHS_FN(move_items)(NBHS* hs, NBHS_Table* latest, NBHS_Table* prev, 
         return prev;
     }
 
-    NBHS__BEGIN("copying old");
+    EBR__BEGIN("copying old");
     for (size_t i = old; i < new; i++) {
         // either NULL or complete can go thru without waiting
         void* old_p = atomic_load(&prev->data[i]);
@@ -360,7 +349,7 @@ NBHS_Table* NBHS_FN(move_items)(NBHS* hs, NBHS_Table* latest, NBHS_Table* prev, 
             NBHS_FN(raw_intern)(hs, latest, NULL, old_p);
         }
     }
-    NBHS__END();
+    EBR__END();
 
     uint32_t done = atomic_fetch_add(&prev->move_done, new - old);
     done += new - old;
@@ -368,7 +357,7 @@ NBHS_Table* NBHS_FN(move_items)(NBHS* hs, NBHS_Table* latest, NBHS_Table* prev, 
     assert(done <= cap);
     if (done == cap) {
         // dettach now
-        NBHS__BEGIN("detach");
+        EBR__BEGIN("detach");
         latest->prev = NULL;
         ebr_exit_cs();
 
@@ -376,13 +365,13 @@ NBHS_Table* NBHS_FN(move_items)(NBHS* hs, NBHS_Table* latest, NBHS_Table* prev, 
 
         ebr_enter_cs();
         prev = NULL;
-        NBHS__END();
+        EBR__END();
     }
     return prev;
 }
 
 void* NBHS_FN(get)(NBHS* hs, void* val) {
-    NBHS__BEGIN("intern");
+    EBR__BEGIN("intern");
 
     assert(val);
 
@@ -426,12 +415,12 @@ void* NBHS_FN(get)(NBHS* hs, void* val) {
     } while (i != first);
 
     ebr_exit_cs();
-    NBHS__END();
+    EBR__END();
     return result;
 }
 
 void* NBHS_FN(intern)(NBHS* hs, void* val) {
-    NBHS__BEGIN("intern");
+    EBR__BEGIN("intern");
 
     assert(val);
     ebr_enter_cs();
@@ -449,20 +438,20 @@ void* NBHS_FN(intern)(NBHS* hs, void* val) {
     void* result = NBHS_FN(raw_intern)(hs, latest, prev, val);
 
     ebr_exit_cs();
-    NBHS__END();
+    EBR__END();
     return result;
 }
 
 // waits for all items to be moved up before continuing
 void NBHS_FN(resize_barrier)(NBHS* hs) {
-    NBHS__BEGIN("intern");
+    EBR__BEGIN("intern");
     ebr_enter_cs();
     NBHS_Table *prev, *latest = atomic_load(&hs->latest);
     while (prev = atomic_load(&latest->prev), prev != NULL) {
         NBHS_FN(move_items)(hs, latest, prev, prev->cap);
     }
     ebr_exit_cs();
-    NBHS__END();
+    EBR__END();
 }
 
 #undef NBHS_FN

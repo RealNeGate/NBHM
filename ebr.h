@@ -56,6 +56,12 @@ void cuikperf_thread_start(void);
 void cuikperf_thread_stop(void);
 void cuikperf_region_start(const char* label, const char* extra);
 void cuikperf_region_end(void);
+
+#define EBR__BEGIN(name)      spall_auto_buffer_begin(name, sizeof(name) - 1, NULL, 0)
+#define EBR__END()            spall_auto_buffer_end()
+#else
+#define EBR__BEGIN(name)
+#define EBR__END()
 #endif
 
 typedef struct EBR_Entry EBR_Entry;
@@ -88,12 +94,16 @@ static _Thread_local EBR_Entry* ebr_thread_entry;
 // concurrent free-list
 static _Atomic(EBR_FreeNode*) ebr_free_list;
 static _Atomic(EBR_Entry*) ebr_list;
-static _Atomic bool ebr_running;
 static thrd_t ebr_thread;
+
+static _Atomic bool ebr_running;
+static mtx_t ebr_mutex;
+static cnd_t ebr_exit_signal;
 
 void ebr_deinit(void) {
     if (ebr_running) {
         ebr_running = false;
+        cnd_broadcast(&ebr_exit_signal);
 
         int res;
         thrd_join(ebr_thread, &res);
@@ -111,7 +121,9 @@ static int ebr_thread_fn(void* arg) {
     atexit(ebr_deinit);
 
     while (ebr_running) {
+        #if EBR_DEBOOGING
         cuikperf_region_start("cycle", NULL);
+        #endif
 
         // clear the free list, then we wait for the checkpoint before
         // freeing the memory.
@@ -120,7 +132,10 @@ static int ebr_thread_fn(void* arg) {
         // threads visible who could've written to free_list, we can scan more.
         EBR_Entry* thread_list = atomic_load(&ebr_list);
 
+        #if EBR_DEBOOGING
         cuikperf_region_start("Checkpoint", NULL);
+        #endif
+
         // wait for the critical sections to advance, once
         // that happens we can choose to free things.
         for (EBR_Entry* list = thread_list; list; list = list->next) {
@@ -143,9 +158,12 @@ static int ebr_thread_fn(void* arg) {
 
             list->gc_mark = false;
         }
-        cuikperf_region_end();
 
+        #if EBR_DEBOOGING
+        cuikperf_region_end();
         cuikperf_region_start("Reclaim memory", NULL);
+        #endif
+
         if (last_free_list) {
             EBR_FreeNode* list = last_free_list;
             while (list) {
@@ -162,9 +180,12 @@ static int ebr_thread_fn(void* arg) {
             EBR_VIRTUAL_FREE(free_list->ptr, free_list->size);
         }
         last_free_list = free_list;
-        cuikperf_region_end();
 
+        #if EBR_DEBOOGING
+        cuikperf_region_end();
         cuikperf_region_start("Thread GC", NULL);
+        #endif
+
         // mark the dead threads and then remove them from the list
         #ifdef _WIN32
         uint32_t pid = GetCurrentProcessId();
@@ -173,10 +194,16 @@ static int ebr_thread_fn(void* arg) {
         // mark phase
         THREADENTRY32 te32 = { .dwSize = sizeof(THREADENTRY32) };
 
+        #if EBR_DEBOOGING
         cuikperf_region_start("Thread32First", NULL);
+        #endif
+
         if (Thread32First(snapshot, &te32)) {
             do {
+                #if EBR_DEBOOGING
                 cuikperf_region_end();
+                #endif
+
                 if (!ebr_running) {
                     break;
                 }
@@ -190,9 +217,15 @@ static int ebr_thread_fn(void* arg) {
                         }
                     }
                 }
+
+                #if EBR_DEBOOGING
                 cuikperf_region_start("Thread32Next", NULL);
+                #endif
             } while (Thread32Next(snapshot, &te32));
+
+            #if EBR_DEBOOGING
             cuikperf_region_end();
+            #endif
         }
         CloseHandle(snapshot);
 
@@ -205,7 +238,7 @@ static int ebr_thread_fn(void* arg) {
             // we can't free the first entry in the list without causing issues so we just
             // mark it as dead for now, next cycle we'll try again
             if (!list->gc_mark && prev != NULL) {
-                printf("THREAD %u DIED!\n", list->os_handle);
+                // printf("THREAD %u DIED!\n", list->os_handle);
 
                 // object was marked as dead, let's remove the entry
                 atomic_store_explicit(&prev->next, next, memory_order_release);
@@ -222,11 +255,16 @@ static int ebr_thread_fn(void* arg) {
             list = next;
         }
         #endif
+
+        #if EBR_DEBOOGING
         cuikperf_region_end();
         cuikperf_region_end();
+        #endif
 
         // we're in no rush to free to might as well yield some time
-        thrd_yield();
+        mtx_lock(&ebr_mutex);
+        cnd_timedwait(&ebr_exit_signal, &ebr_mutex, &(struct timespec){.tv_sec=0, .tv_nsec=500000000});
+        mtx_unlock(&ebr_mutex);
     }
 
     #if EBR_DEBOOGING
@@ -237,6 +275,8 @@ static int ebr_thread_fn(void* arg) {
 }
 
 static void ebr_once_init(void) {
+    mtx_init(&ebr_mutex, mtx_plain);
+    cnd_init(&ebr_exit_signal);
     thrd_create(&ebr_thread, ebr_thread_fn, NULL);
 }
 

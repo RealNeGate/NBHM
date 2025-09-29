@@ -31,17 +31,6 @@
 
 #include "ebr.h"
 
-// personal debooging stuff
-#define NBHM__DEBOOGING 0
-
-#if NBHM__DEBOOGING
-#define NBHM__BEGIN(name)      spall_auto_buffer_begin(name, sizeof(name) - 1, NULL, 0)
-#define NBHM__END()            spall_auto_buffer_end()
-#else
-#define NBHM__BEGIN(name)
-#define NBHM__END()
-#endif
-
 // for the time in the ebr entry
 #define NBHM_PINNED_BIT (1ull << 63ull)
 #define NBHM_PRIME_BIT  (1ull << 63ull)
@@ -233,7 +222,7 @@ extern int NBHM_NO_MATCH_OLD;
 
 static void* NBHM_FN(put_if_match)(NBHM* hs, NBHM_Table* latest, NBHM_Table* prev, void* key, void* val, void* exp);
 
-static size_t NBHS_FN(hash2index)(NBHS_Table* table, uint64_t u) {
+static size_t NBHM_FN(hash2index)(NBHM_Table* table, uint64_t u) {
     uint64_t v = table->a;
 
     // Multiply high 64: Ripped, straight, from, Hacker's delight... mmm delight
@@ -272,7 +261,7 @@ NBHM_Table* NBHM_FN(move_items)(NBHM* hm, NBHM_Table* latest, NBHM_Table* prev, 
         return prev;
     }
 
-    NBHM__BEGIN("copying old");
+    EBR__BEGIN("copying old");
     for (size_t i = old; i < new; i++) {
         void* old_v = atomic_load(&prev->data[i].val);
         void* k     = atomic_load(&prev->data[i].key);
@@ -291,7 +280,7 @@ NBHM_Table* NBHM_FN(move_items)(NBHM* hm, NBHM_Table* latest, NBHM_Table* prev, 
             // btw, CAS updated old_v
         }
     }
-    NBHM__END();
+    EBR__END();
 
     uint32_t done = atomic_fetch_add(&prev->move_done, new - old);
     done += new - old;
@@ -299,7 +288,7 @@ NBHM_Table* NBHM_FN(move_items)(NBHM* hm, NBHM_Table* latest, NBHM_Table* prev, 
     assert(done <= cap);
     if (done == cap) {
         // dettach now
-        NBHM__BEGIN("detach");
+        EBR__BEGIN("detach");
         latest->prev = NULL;
         ebr_exit_cs();
 
@@ -307,7 +296,7 @@ NBHM_Table* NBHM_FN(move_items)(NBHM* hm, NBHM_Table* latest, NBHM_Table* prev, 
 
         ebr_enter_cs();
         prev = NULL;
-        NBHM__END();
+        EBR__END();
     }
     return prev;
 }
@@ -451,7 +440,7 @@ static void* NBHM_FN(put_if_match)(NBHM* hs, NBHM_Table* latest, NBHM_Table* pre
 }
 
 void* NBHM_FN(put)(NBHM* hm, void* key, void* val) {
-    NBHM__BEGIN("put");
+    EBR__BEGIN("put");
 
     assert(val);
     ebr_enter_cs();
@@ -468,12 +457,12 @@ void* NBHM_FN(put)(NBHM* hm, void* key, void* val) {
 
     void* v = NBHM_FN(put_if_match)(hm, latest, prev, key, val, &NBHM_NO_MATCH_OLD);
     ebr_exit_cs();
-    NBHM__END();
+    EBR__END();
     return v;
 }
 
 void* NBHM_FN(remove)(NBHM* hm, void* key) {
-    NBHM__BEGIN("remove");
+    EBR__BEGIN("remove");
 
     assert(key);
     ebr_enter_cs();
@@ -490,12 +479,12 @@ void* NBHM_FN(remove)(NBHM* hm, void* key) {
 
     void* v = NBHM_FN(put_if_match)(hm, latest, prev, key, &NBHM_TOMBSTONE, &NBHM_NO_MATCH_OLD);
     ebr_exit_cs();
-    NBHM__END();
+    EBR__END();
     return v;
 }
 
 void* NBHM_FN(get)(NBHM* hm, void* key) {
-    NBHM__BEGIN("get");
+    EBR__BEGIN("get");
 
     assert(key);
     ebr_enter_cs();
@@ -534,12 +523,12 @@ void* NBHM_FN(get)(NBHM* hm, void* key) {
     } while (i != first);
 
     ebr_exit_cs();
-    NBHM__END();
+    EBR__END();
     return v;
 }
 
 void* NBHM_FN(put_if_null)(NBHM* hm, void* val) {
-    NBHM__BEGIN("put");
+    EBR__BEGIN("put");
 
     assert(val);
     ebr_enter_cs();
@@ -556,20 +545,20 @@ void* NBHM_FN(put_if_null)(NBHM* hm, void* val) {
 
     void* v = NBHM_FN(put_if_match)(hm, latest, prev, val, val, &NBHM_TOMBSTONE);
     ebr_exit_cs();
-    NBHM__END();
+    EBR__END();
     return v;
 }
 
 // waits for all items to be moved up before continuing
 void NBHM_FN(resize_barrier)(NBHM* hm) {
-    NBHM__BEGIN("resize_barrier");
+    EBR__BEGIN("resize_barrier");
     ebr_enter_cs();
     NBHM_Table *prev, *latest = atomic_load(&hm->latest);
     while (prev = atomic_load(&latest->prev), prev != NULL) {
         NBHM_FN(move_items)(hm, latest, prev, prev->cap);
     }
     ebr_exit_cs();
-    NBHM__END();
+    EBR__END();
 }
 
 #undef NBHM_FN
