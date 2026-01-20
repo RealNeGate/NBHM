@@ -23,7 +23,6 @@
 #ifndef NBHS_H
 #define NBHS_H
 
-#include <threads.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdatomic.h>
@@ -234,7 +233,7 @@ static void* NBHS_FN(raw_intern)(NBHS* hs, NBHS_Table* latest, NBHS_Table* prev,
     for (;;) {
         size_t cap = latest->cap;
         size_t limit = (cap * NBHS_LOAD_FACTOR) / 100;
-        if (prev == NULL && latest->count >= limit) {
+        if (latest->count >= limit) {
             // make resized table, we'll amortize the moves upward
             size_t new_cap = nbhs_compute_cap(limit*2);
 
@@ -261,12 +260,13 @@ static void* NBHS_FN(raw_intern)(NBHS* hs, NBHS_Table* latest, NBHS_Table* prev,
             void* entry = atomic_load(&latest->data[i]);
             if (entry == NULL) {
                 void* to_write = val;
-                if (__builtin_expect(prev != NULL, 0)) {
-                    assert(prev->prev == NULL);
+                while (prev != NULL) {
                     void* old = NBHS_FN(raw_lookup)(hs, prev, h, val);
                     if (old != NULL) {
                         to_write = old;
+                        break;
                     }
+                    prev = prev->prev;
                 }
 
                 // fight to be the one to land into the modern table
@@ -327,18 +327,14 @@ NBHS_Table* NBHS_FN(move_items)(NBHS* hs, NBHS_Table* latest, NBHS_Table* prev, 
     size_t cap = prev->cap;
 
     // snatch up some number of items
-    uint32_t old, new;
+    uint32_t new;
+    uint32_t old = atomic_load_explicit(&prev->moved, memory_order_relaxed);
     do {
-        old = atomic_load(&prev->moved);
-        if (old == cap) { return prev; }
         // cap the number of items to copy... by the cap
         new = old + items_to_move;
         if (new > cap) { new = cap; }
-    } while (!atomic_compare_exchange_strong(&prev->moved, &(uint32_t){ old }, new));
-
-    if (old == new) {
-        return prev;
-    }
+        if (old == cap) { break; }
+    } while (!atomic_compare_exchange_strong(&prev->moved, &old, new));
 
     EBR__BEGIN("copying old");
     for (size_t i = old; i < new; i++) {
@@ -351,6 +347,7 @@ NBHS_Table* NBHS_FN(move_items)(NBHS* hs, NBHS_Table* latest, NBHS_Table* prev, 
     }
     EBR__END();
 
+    assert(old <= new);
     uint32_t done = atomic_fetch_add(&prev->move_done, new - old);
     done += new - old;
 
@@ -358,13 +355,15 @@ NBHS_Table* NBHS_FN(move_items)(NBHS* hs, NBHS_Table* latest, NBHS_Table* prev, 
     if (done == cap) {
         // dettach now
         EBR__BEGIN("detach");
-        latest->prev = NULL;
-        ebr_exit_cs();
+        NBHS_Table* prev_prev = prev->prev;
+        if (atomic_compare_exchange_strong(&latest->prev, &prev, prev_prev)) {
+            ebr_exit_cs();
 
-        ebr_free(prev, sizeof(NBHS_Table) + prev->cap*sizeof(void*));
+            ebr_free(prev, sizeof(NBHS_Table) + prev->cap*sizeof(void*));
 
-        ebr_enter_cs();
-        prev = NULL;
+            ebr_enter_cs();
+            prev = prev_prev;
+        }
         EBR__END();
     }
     return prev;
@@ -383,9 +382,7 @@ void* NBHS_FN(get)(NBHS* hs, void* val) {
     NBHS_Table* prev = atomic_load(&latest->prev);
     if (prev) {
         prev = NBHS_FN(move_items)(hs, latest, prev, NBHS_MOVE_AMOUNT);
-        if (prev == NULL) {
-            latest = atomic_load(&hs->latest);
-        }
+        latest = atomic_load(&hs->latest);
     }
 
     // just lookup into the tables, we don't need to reserve
@@ -429,10 +426,8 @@ void* NBHS_FN(intern)(NBHS* hs, void* val) {
     // if there's earlier versions of the table we can move up entries as we go along.
     NBHS_Table* prev = atomic_load(&latest->prev);
     if (prev) {
-        prev = NBHS_FN(move_items)(hs, latest, prev, NBHS_MOVE_AMOUNT);
-        if (prev == NULL) {
-            latest = atomic_load(&hs->latest);
-        }
+        prev   = NBHS_FN(move_items)(hs, latest, prev, NBHS_MOVE_AMOUNT);
+        latest = atomic_load(&hs->latest);
     }
 
     void* result = NBHS_FN(raw_intern)(hs, latest, prev, val);

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stdbool.h>
+#include <pthread.h>
 #include <stdatomic.h>
 
 #define USE_SPALL 0
@@ -150,7 +151,7 @@ static int test_thread_fn(void* arg) {
     } else {
         for (int i = 0; i < attempts; i++) {
             arr[i] = pcg32_pie(&seed) & 0xFFFFFF;
-            if (my_put_if_null(&test_set, &arr[i]) == &arr[i]) {
+            if (my_put_if_null(&test_set, &arr[i], &arr[i]) == &arr[i]) {
                 stats[0] += 1; // insertions
             } else {
                 stats[1] += 1; // duplicate

@@ -38,14 +38,6 @@ enum {
     NBHM_MOVE_AMOUNT = 256,
 };
 
-typedef struct NBHM_EBREntry {
-    _Atomic(struct NBHM_EBREntry*) next;
-    _Atomic(uint64_t) time;
-
-    // keep on a separate cacheline to avoid false sharing
-    _Alignas(64) int id;
-} NBHM_EBREntry;
-
 typedef struct {
     _Atomic(void*) key;
     _Atomic(void*) val;
@@ -171,7 +163,7 @@ static void nbhm_compute_size(NBHM_Table* table, size_t cap) {
 
     #if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
     uint64_t d,e;
-    __asm__("divq %[v]" : "=a"(d), "=d"(e) : [v] "r"(cap), "a"(cap - 1), "d"(1ull << table->sh));
+    __asm__("div %[v]" : "=a"(d), "=d"(e) : [v] "r"(cap), "a"(cap - 1), "d"(1ull << table->sh));
     assert(d == table->a);
     #endif
 
@@ -287,13 +279,13 @@ NBHM_Table* NBHM_FN(move_items)(NBHM* hm, NBHM_Table* latest, NBHM_Table* prev, 
     if (done == cap) {
         // dettach now
         EBR__BEGIN("detach");
-        latest->prev = NULL;
-        ebr_exit_cs();
-
-        ebr_free(prev, sizeof(NBHM_Table) + prev->cap*sizeof(void*));
-
-        ebr_enter_cs();
-        prev = NULL;
+        NBHM_Table* prev_prev = prev->prev;
+        if (atomic_compare_exchange_strong(&latest->prev, &prev, prev_prev)) {
+            ebr_exit_cs();
+            ebr_free(prev, sizeof(NBHM_Table) + prev->cap*sizeof(NBHM_Entry));
+            ebr_enter_cs();
+            prev = prev_prev;
+        }
         EBR__END();
     }
     return prev;
@@ -354,7 +346,7 @@ static void* NBHM_FN(put_if_match)(NBHM* hs, NBHM_Table* latest, NBHM_Table* pre
     for (;;) {
         uint32_t cap = latest->cap;
         size_t limit = (cap * NBHM_LOAD_FACTOR) / 100;
-        if (prev == NULL && latest->count >= limit) {
+        if (latest->count >= limit) {
             // make resized table, we'll amortize the moves upward
             size_t new_cap = nbhm_compute_cap(limit*2);
 
@@ -420,16 +412,20 @@ static void* NBHM_FN(put_if_match)(NBHM* hs, NBHM_Table* latest, NBHM_Table* pre
         // migration barrier, we only insert our item once we've
         // "logically" moved it
         if (v == NULL && prev != NULL) {
-            assert(prev->prev == NULL);
-            void* old = NBHM_FN(freeze_item)(hs, prev, h, val);
-            if (old != NULL) {
-                // the old value might've been primed, we don't want to propagate the prime bit tho
-                old = (void*) (((uintptr_t) old) & ~NBHM_PRIME_BIT);
+            void* to_write = val;
+            while (prev != NULL) {
+                void* old = NBHM_FN(freeze_item)(hs, prev, h, val);
+                if (old != NULL) {
+                    // the old value might've been primed, we don't want to propagate the prime bit tho
+                    old = (void*) (((uintptr_t) old) & ~NBHM_PRIME_BIT);
 
-                // if we lost, then we just get replaced by a separate fella (which is fine ig)
-                if (atomic_compare_exchange_strong(&latest->data[i].val, &v, old)) {
-                    v = old;
+                    // if we lost, then we just get replaced by a separate fella (which is fine ig)
+                    if (atomic_compare_exchange_strong(&latest->data[i].val, &v, old)) {
+                        v = old;
+                    }
+                    break;
                 }
+                prev = prev->prev;
             }
         }
 
@@ -553,7 +549,7 @@ void* NBHM_FN(get)(NBHM* hm, void* key) {
     return v;
 }
 
-void* NBHM_FN(put_if_null)(NBHM* hm, void* val) {
+void* NBHM_FN(put_if_null)(NBHM* hm, void* key, void* val) {
     EBR__BEGIN("put");
 
     assert(val);
@@ -569,7 +565,7 @@ void* NBHM_FN(put_if_null)(NBHM* hm, void* val) {
         }
     }
 
-    void* v = NBHM_FN(put_if_match)(hm, latest, prev, val, val, &NBHM_TOMBSTONE);
+    void* v = NBHM_FN(put_if_match)(hm, latest, prev, key, val, &NBHM_TOMBSTONE);
     ebr_exit_cs();
     EBR__END();
     return v;
