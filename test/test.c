@@ -12,6 +12,7 @@
 #define USE_SPALL 0
 
 #if USE_SPALL
+#define SPALL_AUTO_IMPLEMENTATION
 #include "spall_native_auto.h"
 #else
 #define spall_auto_buffer_begin(...)
@@ -21,16 +22,17 @@
 static int num_threads;
 
 static uint32_t my_hash(const void* a) {
-    const uint8_t* data = a;
-    uint32_t h = 0x811C9DC5;
-    for (size_t i = 0; i < 4; i++) {
-        h = (data[i] ^ h) * 0x01000193;
-    }
-    return h;
+    uint32_t x = (uint32_t) (uintptr_t) a;
+    x = ((x >> 16) ^ x) * 0x45d9f3bU;
+    x = ((x >> 16) ^ x) * 0x45d9f3bU;
+    x = (x >> 16) ^ x;
+    return x;
 }
 
 static bool my_cmp(const void* a, const void* b) {
-    return *(const uint32_t*)a == *(const uint32_t*)b;
+    uint32_t x = (uint32_t) (uintptr_t) a;
+    uint32_t y = (uint32_t) (uintptr_t) b;
+    return x == y;
 }
 
 #define EBR_IMPL
@@ -125,33 +127,31 @@ static uint32_t current_thread_id() {
     #endif
 }
 
+static int rounds;
 static int test_thread_fn(void* arg) {
     uintptr_t starting_id = (uintptr_t) arg;
-    uint64_t seed = starting_id * 11400714819323198485ULL;
+
+    uint64_t full_id = (rounds*num_threads + starting_id + 1) << 56ull;
+    uint64_t seed    = full_id * 11400714819323198485ULL;
 
     int* stats = &thread_stats[starting_id*16];
-    uint32_t* arr = malloc(attempts * sizeof(uint32_t));
-    // printf("Launched! T%u\n", current_thread_id());
+    stats[0] = stats[1] = 0;
+
+    // printf("Launched! %zu\n", 1+starting_id);
 
     #if USE_SPALL
-    spall_auto_thread_init(starting_id, SPALL_DEFAULT_BUFFER_SIZE);
+    spall_auto_thread_init(1+starting_id, SPALL_DEFAULT_BUFFER_SIZE);
     spall_auto_buffer_begin("work", 4, NULL, 0);
     #endif
 
     uint64_t start = get_nanos();
     if (testing_lhs) {
-        for (int i = 0; i < attempts; i++) {
-            arr[i] = pcg32_pie(&seed) & 0xFFFFFF;
-            if (lhs_intern(test_lhs, &arr[i]) == &arr[i]) {
-                stats[0] += 1; // insertions
-            } else {
-                stats[1] += 1; // duplicate
-            }
-        }
+        abort();
     } else {
-        for (int i = 0; i < attempts; i++) {
-            arr[i] = pcg32_pie(&seed) & 0xFFFFFF;
-            if (my_put_if_null(&test_set, &arr[i], &arr[i]) == &arr[i]) {
+        for (size_t i = 0; i < attempts; i++) {
+            uintptr_t k = (uintptr_t) pcg32_pie(&seed) & 0xFFFFF;
+            void* key = (void*) (k | full_id | (i << 32ull));
+            if (my_put_if_null(&test_set, key, key) == key) {
                 stats[0] += 1; // insertions
             } else {
                 stats[1] += 1; // duplicate
@@ -182,8 +182,7 @@ int main(int argc, char** argv) {
         printf("  With Locked hashset...\n");
     }
 
-    // attempts = 1000000000 / threads;
-    attempts = 100000000 / num_threads;
+    attempts     = 16000000 / num_threads;
     thread_stats = calloc(num_threads, 64 * sizeof(int));
 
     if (testing_lhs) {
@@ -195,9 +194,19 @@ int main(int argc, char** argv) {
         #endif
     } else {
         test_set = nbhm_alloc(32);
+
+        /* printf("Example!\n");
+
+        void* key;
+        key = (void*) (16ull | (2ull << 32ull));
+        printf("A %p\n", my_put_if_null(&test_set, key, key));
+
+        key = (void*) (16ull | (1ull << 32ull));
+        printf("B %p\n", my_put_if_null(&test_set, key, key));
+        return 0; */
     }
 
-    for (int j = 0; j < 10; j++) {
+    for (int j = 0; j < 1; j++) {
         total_time = 0;
         thrd_t* arr = malloc(num_threads * sizeof(thrd_t));
         for (int i = 0; i < num_threads; i++) {
@@ -207,7 +216,16 @@ int main(int argc, char** argv) {
             thrd_join(arr[i], NULL);
         }
 
-        printf("%.4f ns/op (total=%.4f ms)\n", total_time / 100000000.0, total_time / 1000000.0);
+        double ops = attempts * num_threads;
+        printf("%.4f ns/op (total=%.4f ms)\n", total_time / ops, total_time / 1000000.0);
+
+        int ins = 0, dup = 0;
+        for (int i = 0; i < num_threads; i++) {
+            ins += thread_stats[16*i];
+            dup += thread_stats[16*i + 1];
+        }
+        printf("  %d inserts, %d duplicates\n", ins, dup);
+        rounds++;
     }
 
     /* int inserted = 0, duplicates = 0;
