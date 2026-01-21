@@ -149,7 +149,7 @@ static int test_thread_fn(void* arg) {
         abort();
     } else {
         for (size_t i = 0; i < attempts; i++) {
-            uintptr_t k = (uintptr_t) pcg32_pie(&seed) & 0xFFFFF;
+            uintptr_t k = (uintptr_t) pcg32_pie(&seed) & 0x1FFFFF;
             void* key = (void*) (k | full_id | (i << 32ull));
             if (my_put_if_null(&test_set, key, key) == key) {
                 stats[0] += 1; // insertions
@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
         return 0; */
     }
 
-    for (int j = 0; j < 1; j++) {
+    for (int j = 0; j < 10; j++) {
         total_time = 0;
         thrd_t* arr = malloc(num_threads * sizeof(thrd_t));
         for (int i = 0; i < num_threads; i++) {

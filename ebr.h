@@ -132,16 +132,19 @@ static int ebr_thread_fn(void* arg) {
         EBR_Entry* thread_list = atomic_load(&ebr_list);
 
         EBR__BEGIN("Checkpoint");
-
         // wait for the critical sections to advance, once
         // that happens we can choose to free things.
+        for (EBR_Entry* list = thread_list; list; list = list->next) {
+            list->checkpoint_t = list->time;
+        }
+
         for (EBR_Entry* list = thread_list; list; list = list->next) {
             uint64_t before_t = list->checkpoint_t;
             if (before_t & EBR_PINNED_BIT) {
                 uint64_t now_t, tries = 0;
                 do {
                     // once we're at this a bunch of times, we start to yield
-                    if (tries > 4) {
+                    if (tries > 30) {
                         thrd_yield();
                     }
 
@@ -163,7 +166,7 @@ static int ebr_thread_fn(void* arg) {
             EBR_FreeNode* list = last_free_list;
             while (list) {
                 EBR_FreeNode* next = list->next;
-                EBR_REALLOC(list, 0);
+                (void) EBR_REALLOC(list, 0);
                 list = next;
             }
             last_free_list = NULL;
@@ -173,6 +176,7 @@ static int ebr_thread_fn(void* arg) {
         // so we can't free it until the next iteration.
         for (; free_list; free_list = free_list->next) {
             EBR_VIRTUAL_FREE(free_list->ptr, free_list->size);
+            // printf("FREE %p %zu\n", free_list->ptr, free_list->size);
         }
         last_free_list = free_list;
 
@@ -284,6 +288,8 @@ void ebr_free(void* ptr, size_t size) {
     do {
         node->next = list;
     } while (!atomic_compare_exchange_strong(&ebr_free_list, &list, node));
+
+    // printf("FREE @ %p %#zx %p\n", ebr_thread_entry, ebr_thread_entry->time, ptr);
 }
 
 void ebr_enter_cs(void) {

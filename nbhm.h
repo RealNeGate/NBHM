@@ -35,7 +35,7 @@
 
 enum {
     NBHM_LOAD_FACTOR = 75,
-    NBHM_MOVE_AMOUNT = 256,
+    NBHM_MOVE_AMOUNT = 512,
 };
 
 typedef struct {
@@ -45,7 +45,7 @@ typedef struct {
 
 typedef struct NBHM_Table NBHM_Table;
 struct NBHM_Table {
-    _Atomic(NBHM_Table*) prev;
+    _Atomic(NBHM_Table*) next;
 
     uint32_t cap;
 
@@ -62,14 +62,8 @@ struct NBHM_Table {
 };
 
 typedef struct {
-    _Atomic(NBHM_Table*) latest;
+    _Atomic(NBHM_Table*) curr;
 } NBHM;
-
-typedef struct NBHM_FreeNode NBHM_FreeNode;
-struct NBHM_FreeNode {
-    _Atomic(NBHM_FreeNode*) next;
-    NBHM_Table* table;
-};
 
 static size_t nbhm_compute_cap(size_t y) {
     // minimum capacity
@@ -176,22 +170,22 @@ static NBHM nbhm_alloc(size_t initial_cap) {
     size_t cap = nbhm_compute_cap(initial_cap);
     NBHM_Table* table = EBR_VIRTUAL_ALLOC(sizeof(NBHM_Table) + cap*sizeof(NBHM_Entry));
     nbhm_compute_size(table, cap);
-    return (NBHM){ .latest = table };
+    return (NBHM){ .curr = table };
 }
 
 static void nbhm_free(NBHM* hs) {
-    NBHM_Table* curr = hs->latest;
+    NBHM_Table* curr = hs->curr;
     while (curr) {
-        NBHM_Table* next = curr->prev;
+        NBHM_Table* next = curr->next;
         EBR_VIRTUAL_FREE(curr, sizeof(NBHM_Table) + curr->cap*sizeof(NBHM_Entry));
         curr = next;
     }
 }
 
 // for spooky stuff
-static NBHM_Entry* nbhm_array(NBHM* hs) { return hs->latest->data; }
-static size_t nbhm_count(NBHM* hs)      { return hs->latest->count; }
-static size_t nbhm_capacity(NBHM* hs)   { return hs->latest->cap; }
+static NBHM_Entry* nbhm_array(NBHM* hs) { return hs->curr->data; }
+static size_t nbhm_count(NBHM* hs)      { return hs->curr->count; }
+static size_t nbhm_capacity(NBHM* hs)   { return hs->curr->cap; }
 
 #define nbhm_for(it, hs) for (NBHM_Entry *it = nbhm_array(hs), **_end_ = &it[nbhm_capacity(hs)]; it != _end_; it++) if (*it != NULL)
 #endif // NBHM_H
@@ -210,7 +204,7 @@ int NBHM_NO_MATCH_OLD;
 extern int NBHM_TOMBSTONE;
 extern int NBHM_NO_MATCH_OLD;
 
-static void* NBHM_FN(put_if_match)(NBHM* hs, NBHM_Table* latest, NBHM_Table* prev, void* key, void* val, void* exp);
+static void* NBHM_FN(put_if_match)(NBHM_Table* latest, void* key, void* val, void* exp);
 
 static size_t NBHM_FN(hash2index)(NBHM_Table* table, uint64_t u) {
     uint64_t v = table->a;
@@ -233,139 +227,107 @@ static size_t NBHM_FN(hash2index)(NBHM_Table* table, uint64_t u) {
     return q2;
 }
 
-NBHM_Table* NBHM_FN(move_items)(NBHM* hm, NBHM_Table* latest, NBHM_Table* prev, int items_to_move) {
-    assert(prev);
-    size_t cap = prev->cap;
+static void* NBHM_FN(migrate_item)(NBHM_Table* table, NBHM_Table* new_table, size_t i);
+NBHM_Table* NBHM_FN(move_items)(NBHM* hm, NBHM_Table* top_table, NBHM_Table* old_table, int items_to_move) {
+    assert(old_table);
+    size_t cap = old_table->cap;
 
     // snatch up some number of items
     uint32_t old, new;
     do {
-        old = atomic_load(&prev->moved);
-        if (old == cap) { return prev; }
+        old = atomic_load(&old_table->moved);
+        if (old == cap) { return old_table; }
         // cap the number of items to copy... by the cap
         new = old + items_to_move;
         if (new > cap) { new = cap; }
-    } while (!atomic_compare_exchange_strong(&prev->moved, &(uint32_t){ old }, new));
+    } while (!atomic_compare_exchange_strong(&old_table->moved, &(uint32_t){ old }, new));
 
     if (old == new) {
-        return prev;
+        return old_table;
     }
 
     EBR__BEGIN("copying old");
     for (size_t i = old; i < new; i++) {
-        void* old_v = atomic_load(&prev->data[i].val);
-        void* k     = atomic_load(&prev->data[i].key);
-
-        // freeze the values by adding a prime bit.
-        while (((uintptr_t) old_v & NBHM_PRIME_BIT) == 0) {
-            uintptr_t primed_v = (old_v == &NBHM_TOMBSTONE ? 0 : (uintptr_t) old_v) | NBHM_PRIME_BIT;
-            if (atomic_compare_exchange_strong(&prev->data[i].val, &old_v, (void*) primed_v)) {
-                if (old_v != NULL && old_v != &NBHM_TOMBSTONE) {
-                    // once we've frozen, we can move it to the new table.
-                    // we pass NULL for prev since we already know the entries exist in prev.
-                    NBHM_FN(put_if_match)(hm, latest, NULL, k, old_v, &NBHM_NO_MATCH_OLD);
-                }
-                break;
-            }
-            // btw, CAS updated old_v
-        }
+        NBHM_FN(migrate_item)(old_table, top_table, i);
     }
     EBR__END();
 
-    uint32_t done = atomic_fetch_add(&prev->move_done, new - old);
+    uint32_t done = atomic_fetch_add(&old_table->move_done, new - old);
     done += new - old;
 
+    // Replace the "freshest" known table with the new one, now that we've migrated all entries
     assert(done <= cap);
-    if (done == cap) {
-        // dettach now
-        EBR__BEGIN("detach");
-        NBHM_Table* prev_prev = prev->prev;
-        if (atomic_compare_exchange_strong(&latest->prev, &prev, prev_prev)) {
-            ebr_exit_cs();
-            ebr_free(prev, sizeof(NBHM_Table) + prev->cap*sizeof(NBHM_Entry));
-            ebr_enter_cs();
-            prev = prev_prev;
-        }
-        EBR__END();
+    if (done == cap && atomic_compare_exchange_strong(&hm->curr, &old_table, top_table)) {
+        ebr_free(old_table, sizeof(NBHM_Table) + old_table->cap*sizeof(NBHM_Entry));
+        return top_table;
     }
-    return prev;
+
+    return old_table;
 }
 
-static void* NBHM_FN(raw_lookup)(NBHM* hs, NBHM_Table* table, uint32_t h, void* key) {
-    size_t cap = table->cap;
-    size_t first = NBHM_FN(hash2index)(table, h), i = first;
-    do {
-        void* v = atomic_load(&table->data[i].val);
-        void* k = atomic_load(&table->data[i].key);
+static void* NBHM_FN(migrate_item)(NBHM_Table* table, NBHM_Table* new_table, size_t i) {
+    // CAS key: NULL -> TOMBSTONE to stop entries from claiming the key
+    void* k = atomic_load_explicit(&table->data[i].key, memory_order_relaxed);
+    while (k == NULL && !atomic_compare_exchange_strong(&table->data[i].key, &k, &NBHM_TOMBSTONE)) {
+        // ...
+    }
 
-        if (k == NULL) {
-            return NULL;
-        } else if (NBHM_FN(cmp)(k, key)) {
-            return v != &NBHM_TOMBSTONE ? v : NULL;
+    if (k == NULL) {
+        return NULL;
+    }
+
+    // freeze the values by adding a prime bit.
+    void* v = atomic_load_explicit(&table->data[i].val, memory_order_relaxed);
+    while (((uintptr_t) v & NBHM_PRIME_BIT) == 0) {
+        uintptr_t primed_v = (v == &NBHM_TOMBSTONE ? 0 : (uintptr_t) v) | NBHM_PRIME_BIT;
+        if (atomic_compare_exchange_strong(&table->data[i].val, &v, (void*) primed_v)) {
+            break;
         }
+        // btw, CAS updated v
+    }
 
-        // inc & wrap around
-        i = (i == cap-1) ? 0 : i + 1;
-    } while (i != first);
+    // strip prime bit
+    v = (void*) ((uintptr_t) v & ~NBHM_PRIME_BIT);
+    // we can now move the value into the new table
+    if (v != NULL) {
+        v = NBHM_FN(put_if_match)(new_table, k, v, NULL);
+    }
 
-    return NULL;
+    // TODO(NeGate): we can replace the PRIME entry with a TOMBPRIME now that we've migrated it up.
+    // ...
+
+    return v;
 }
 
-static void* NBHM_FN(freeze_item)(NBHM* hs, NBHM_Table* table, uint32_t h, void* key) {
-    size_t cap = table->cap;
-    size_t first = NBHM_FN(hash2index)(table, h), i = first;
-    do {
-        void* v = atomic_load(&table->data[i].val);
-        void* k = atomic_load(&table->data[i].key);
+static NBHM_Table* NBHM_FN(resize)(NBHM_Table* table, size_t limit) {
+    // make resized table, we'll amortize the moves upward
+    size_t new_cap = nbhm_compute_cap(limit*2);
 
-        if (k == NULL) {
-            return NULL;
-        } else if (NBHM_FN(cmp)(k, key)) {
-            // freeze the values by adding a prime bit.
-            while (((uintptr_t) v & NBHM_PRIME_BIT) == 0) {
-                uintptr_t primed_v = (v == &NBHM_TOMBSTONE ? 0 : (uintptr_t) v) | NBHM_PRIME_BIT;
-                if (atomic_compare_exchange_strong(&table->data[i].val, &v, (void*) primed_v)) {
-                    break;
-                }
-                // btw, CAS updated v
-            }
-            return v;
-        }
+    NBHM_Table* new_top = EBR_VIRTUAL_ALLOC(sizeof(NBHM_Table) + new_cap*sizeof(NBHM_Entry));
+    nbhm_compute_size(new_top, new_cap);
 
-        // inc & wrap around
-        i = (i == cap-1) ? 0 : i + 1;
-    } while (i != first);
-
-    return NULL;
+    NBHM_Table* exp = NULL;
+    if (!atomic_compare_exchange_strong(&table->next, &exp, new_top)) {
+        EBR_VIRTUAL_FREE(new_top, sizeof(NBHM_Table) + new_cap*sizeof(NBHM_Entry));
+        return exp;
+    } else {
+        // float s = sizeof(NBHM_Table) + new_cap*sizeof(NBHM_Entry);
+        // printf("Resize: %.2f KiB (cap=%zu)\n", s / 1024.0f, new_cap);
+        return new_top;
+    }
 }
 
-static void* NBHM_FN(put_if_match)(NBHM* hs, NBHM_Table* latest, NBHM_Table* prev, void* key, void* val, void* exp) {
+static void* NBHM_FN(put_if_match)(NBHM_Table* table, void* key, void* val, void* exp) {
     assert(key);
 
     void *k, *v;
     for (;;) {
-        uint32_t cap = latest->cap;
+        uint32_t cap = table->cap;
         size_t limit = (cap * NBHM_LOAD_FACTOR) / 100;
-        if (latest->count >= limit) {
-            // make resized table, we'll amortize the moves upward
-            size_t new_cap = nbhm_compute_cap(limit*2);
 
-            NBHM_Table* new_top = EBR_VIRTUAL_ALLOC(sizeof(NBHM_Table) + new_cap*sizeof(NBHM_Entry));
-            nbhm_compute_size(new_top, new_cap);
-
-            // CAS latest -> new_table, if another thread wins the race we'll use its table
-            new_top->prev = latest;
-            if (!atomic_compare_exchange_strong(&hs->latest, &latest, new_top)) {
-                EBR_VIRTUAL_FREE(new_top, sizeof(NBHM_Table) + new_cap*sizeof(NBHM_Entry));
-                prev = atomic_load(&latest->prev);
-            } else {
-                prev   = latest;
-                latest = new_top;
-
-                // float s = sizeof(NBHM_Table) + new_cap*sizeof(NBHM_Entry);
-                // printf("Resize: %.2f KiB (cap=%zu)\n", s / 1024.0f, new_cap);
-            }
-            continue;
+        NBHM_Table* next = atomic_load_explicit(&table->next, memory_order_relaxed);
+        if (next == NULL && table->count >= limit) {
+            next = NBHM_FN(resize)(table, limit);
         }
 
         // key claiming phase:
@@ -375,18 +337,18 @@ static void* NBHM_FN(put_if_match)(NBHM* hs, NBHM_Table* latest, NBHM_Table* pre
         //   goes).
         bool found = false;
         uint32_t h = NBHM_FN(hash)(key);
-        size_t first = NBHM_FN(hash2index)(latest, h), i = first;
+        size_t first = NBHM_FN(hash2index)(table, h), i = first;
         do {
-            v = atomic_load_explicit(&latest->data[i].val, memory_order_acquire);
-            k = atomic_load_explicit(&latest->data[i].key, memory_order_acquire);
+            v = atomic_load_explicit(&table->data[i].val, memory_order_acquire);
+            k = atomic_load_explicit(&table->data[i].key, memory_order_acquire);
 
             if (k == NULL) {
                 // key was never in the table
                 if (val == &NBHM_TOMBSTONE) { return NULL; }
 
                 // fight for empty slot
-                if (atomic_compare_exchange_strong(&latest->data[i].key, &k, key)) {
-                    atomic_fetch_add_explicit(&latest->count, 1, memory_order_relaxed);
+                if (atomic_compare_exchange_strong(&table->data[i].key, &k, key)) {
+                    atomic_fetch_add_explicit(&table->count, 1, memory_order_relaxed);
                     found = true;
                     break;
                 }
@@ -402,36 +364,14 @@ static void* NBHM_FN(put_if_match)(NBHM* hs, NBHM_Table* latest, NBHM_Table* pre
         } while (i != first);
 
         // we didn't claim a key, that means the table is entirely full, retry
-        // to use or make a bigger table.
-        if (!found) {
-            latest = atomic_load(&hs->latest);
-            prev   = atomic_load(&latest->prev);
-            continue;
+        // on a bigger table.
+        if (next == NULL && !found) {
+            next = NBHM_FN(resize)(table, limit);
         }
 
-        // migration barrier, we only insert our item once we've
-        // "logically" moved it
-        if (v == NULL && prev != NULL) {
-            void* to_write = val;
-            while (prev != NULL) {
-                void* old = NBHM_FN(freeze_item)(hs, prev, h, val);
-                if (old != NULL) {
-                    // the old value might've been primed, we don't want to propagate the prime bit tho
-                    old = (void*) (((uintptr_t) old) & ~NBHM_PRIME_BIT);
-
-                    // if we lost, then we just get replaced by a separate fella (which is fine ig)
-                    if (atomic_compare_exchange_strong(&latest->data[i].val, &v, old)) {
-                        v = old;
-                    }
-                    break;
-                }
-                prev = prev->prev;
-            }
-        }
-
-        // if the old value is a prime, we've been had (we're resizing)
-        if (((uintptr_t) v) & NBHM_PRIME_BIT) {
-            continue;
+        // Migration barrier, freeze old entry before inserting to new table
+        if (next != NULL) {
+            return NBHM_FN(migrate_item)(table, next, i);
         }
 
         // if the existing value is:
@@ -444,7 +384,7 @@ static void* NBHM_FN(put_if_match)(NBHM* hs, NBHM_Table* latest, NBHM_Table* pre
             // value writing attempt, if we lose the CAS it means someone could've written a
             // prime (thus the entry was migrated to a later table). It could also mean we lost
             // the insertion fight to another writer and in that case we'll take their value.
-            if (atomic_compare_exchange_strong(&latest->data[i].val, &v, val)) {
+            if (atomic_compare_exchange_strong(&table->data[i].val, &v, val)) {
                 v = val;
             } else {
                 // if we see a prime, the entry has been migrated
@@ -461,23 +401,25 @@ static void* NBHM_FN(put_if_match)(NBHM* hs, NBHM_Table* latest, NBHM_Table* pre
     }
 }
 
+static NBHM_Table* NBHM_FN(coop_migrate)(NBHM* hm) {
+    // Migrate entries into the "next" table, once all are moved we
+    // can just replace the current with it.
+    NBHM_Table* curr = atomic_load(&hm->curr);
+    NBHM_Table* next = atomic_load(&curr->next);
+    if (next != NULL) {
+        return NBHM_FN(move_items)(hm, next, curr, NBHM_MOVE_AMOUNT);
+    }
+    return curr;
+}
+
 void* NBHM_FN(put)(NBHM* hm, void* key, void* val) {
     EBR__BEGIN("put");
 
     assert(val);
     ebr_enter_cs();
-    NBHM_Table* latest = atomic_load(&hm->latest);
+    NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
 
-    // if there's earlier versions of the table we can move up entries as we go along.
-    NBHM_Table* prev = atomic_load(&latest->prev);
-    if (prev != NULL) {
-        prev = NBHM_FN(move_items)(hm, latest, prev, NBHM_MOVE_AMOUNT);
-        if (prev == NULL) {
-            latest = atomic_load(&hm->latest);
-        }
-    }
-
-    void* v = NBHM_FN(put_if_match)(hm, latest, prev, key, val, &NBHM_NO_MATCH_OLD);
+    void* v = NBHM_FN(put_if_match)(curr, key, val, &NBHM_NO_MATCH_OLD);
     ebr_exit_cs();
     EBR__END();
     return v;
@@ -488,21 +430,45 @@ void* NBHM_FN(remove)(NBHM* hm, void* key) {
 
     assert(key);
     ebr_enter_cs();
-    NBHM_Table* latest = atomic_load(&hm->latest);
+    NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
 
-    // if there's earlier versions of the table we can move up entries as we go along.
-    NBHM_Table* prev = atomic_load(&latest->prev);
-    if (prev != NULL) {
-        prev = NBHM_FN(move_items)(hm, latest, prev, NBHM_MOVE_AMOUNT);
-        if (prev == NULL) {
-            latest = atomic_load(&hm->latest);
-        }
-    }
-
-    void* v = NBHM_FN(put_if_match)(hm, latest, prev, key, &NBHM_TOMBSTONE, &NBHM_NO_MATCH_OLD);
+    void* v = NBHM_FN(put_if_match)(curr, key, &NBHM_TOMBSTONE, &NBHM_NO_MATCH_OLD);
     ebr_exit_cs();
     EBR__END();
     return v;
+}
+
+static void* NBHM_FN(raw_lookup)(NBHM_Table* table, uint32_t h, void* key) {
+    do {
+        size_t cap = table->cap;
+        size_t first = NBHM_FN(hash2index)(table, h), i = first;
+
+        do {
+            void* v = atomic_load(&table->data[i].val);
+            void* k = atomic_load(&table->data[i].key);
+
+            if (k == NULL) {
+                // no entry, might be in a newer table
+                return NULL;
+            } else if (NBHM_FN(cmp)(k, key)) {
+                // if we see a non-prime, then it's the latest revision
+                if (((uintptr_t) v & NBHM_PRIME_BIT) == 0) {
+                    return v != &NBHM_TOMBSTONE ? v : NULL;
+                }
+
+                // found partial-copy
+                break;
+            }
+
+            // inc & wrap around
+            i = (i == cap-1) ? 0 : i + 1;
+        } while (i != first);
+
+        // check if other newer but incomplete tables hold the current answer
+        table = atomic_load_explicit(&table->next, memory_order_relaxed);
+    } while (table);
+
+    return NULL;
 }
 
 void* NBHM_FN(get)(NBHM* hm, void* key) {
@@ -510,39 +476,10 @@ void* NBHM_FN(get)(NBHM* hm, void* key) {
 
     assert(key);
     ebr_enter_cs();
-    NBHM_Table* latest = atomic_load(&hm->latest);
+    NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
 
-    // if there's earlier versions of the table we can move up entries as we go along.
-    NBHM_Table* prev = atomic_load(&latest->prev);
-    if (prev != NULL) {
-        prev = NBHM_FN(move_items)(hm, latest, prev, NBHM_MOVE_AMOUNT);
-        if (prev == NULL) {
-            latest = atomic_load(&hm->latest);
-        }
-    }
-
-    uint32_t cap = latest->cap;
     uint32_t h = NBHM_FN(hash)(key);
-    size_t first = NBHM_FN(hash2index)(latest, h), i = first;
-
-    void *k, *v;
-    do {
-        v = atomic_load(&latest->data[i].val);
-        k = atomic_load(&latest->data[i].key);
-
-        if (k == NULL) {
-            // first time seen, maybe the entry hasn't been moved yet
-            if (prev != NULL) {
-                v = NBHM_FN(raw_lookup)(hm, prev, h, key);
-            }
-            break;
-        } else if (NBHM_FN(cmp)(k, key)) {
-            return v;
-        }
-
-        // inc & wrap around
-        i = (i == cap-1) ? 0 : i + 1;
-    } while (i != first);
+    void* v = NBHM_FN(raw_lookup)(curr, h, key);
 
     ebr_exit_cs();
     EBR__END();
@@ -554,18 +491,9 @@ void* NBHM_FN(put_if_null)(NBHM* hm, void* key, void* val) {
 
     assert(val);
     ebr_enter_cs();
-    NBHM_Table* latest = atomic_load(&hm->latest);
+    NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
 
-    // if there's earlier versions of the table we can move up entries as we go along.
-    NBHM_Table* prev = atomic_load(&latest->prev);
-    if (prev != NULL) {
-        prev = NBHM_FN(move_items)(hm, latest, prev, NBHM_MOVE_AMOUNT);
-        if (prev == NULL) {
-            latest = atomic_load(&hm->latest);
-        }
-    }
-
-    void* v = NBHM_FN(put_if_match)(hm, latest, prev, key, val, &NBHM_TOMBSTONE);
+    void* v = NBHM_FN(put_if_match)(curr, key, val, &NBHM_TOMBSTONE);
     ebr_exit_cs();
     EBR__END();
     return v;
@@ -575,9 +503,11 @@ void* NBHM_FN(put_if_null)(NBHM* hm, void* key, void* val) {
 void NBHM_FN(resize_barrier)(NBHM* hm) {
     EBR__BEGIN("resize_barrier");
     ebr_enter_cs();
-    NBHM_Table *prev, *latest = atomic_load(&hm->latest);
-    while (prev = atomic_load(&latest->prev), prev != NULL) {
-        NBHM_FN(move_items)(hm, latest, prev, prev->cap);
+    for (;;) {
+        NBHM_Table* curr = atomic_load(&hm->curr);
+        NBHM_Table* next = atomic_load(&curr->next);
+        if (next == NULL) { break; }
+        NBHM_FN(move_items)(hm, next, curr, curr->cap);
     }
     ebr_exit_cs();
     EBR__END();
