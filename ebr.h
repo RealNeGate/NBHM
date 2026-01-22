@@ -9,6 +9,9 @@
 #include <stddef.h>
 #include <stdatomic.h>
 
+// Used by both data structures for tracking frozen values
+#define EBR_PRIME_BIT (1ull << 63ull)
+
 // Virtual memory allocation (since the tables are generally nicely page-size friendly)
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN

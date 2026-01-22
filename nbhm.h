@@ -30,9 +30,6 @@
 
 #include "ebr.h"
 
-// for the time in the ebr entry
-#define NBHM_PRIME_BIT  (1ull << 63ull)
-
 enum {
     NBHM_LOAD_FACTOR = 75,
     NBHM_MOVE_AMOUNT = 512,
@@ -227,7 +224,40 @@ static size_t NBHM_FN(hash2index)(NBHM_Table* table, uint64_t u) {
     return q2;
 }
 
-static void* NBHM_FN(migrate_item)(NBHM_Table* table, NBHM_Table* new_table, size_t i);
+static void* NBHM_FN(migrate_item)(NBHM_Table* table, NBHM_Table* new_table, size_t i) {
+    // CAS key: NULL -> TOMBSTONE to stop entries from claiming the key
+    void* k = atomic_load_explicit(&table->data[i].key, memory_order_relaxed);
+    while (k == NULL && !atomic_compare_exchange_strong(&table->data[i].key, &k, &NBHM_TOMBSTONE)) {
+        // ...
+    }
+
+    if (k == NULL) {
+        return NULL;
+    }
+
+    // freeze the values by adding a prime bit.
+    void* v = atomic_load_explicit(&table->data[i].val, memory_order_relaxed);
+    while (((uintptr_t) v & EBR_PRIME_BIT) == 0) {
+        uintptr_t primed_v = (v == &NBHM_TOMBSTONE ? 0 : (uintptr_t) v) | EBR_PRIME_BIT;
+        if (atomic_compare_exchange_strong(&table->data[i].val, &v, (void*) primed_v)) {
+            break;
+        }
+        // btw, CAS updated v
+    }
+
+    // strip prime bit
+    v = (void*) ((uintptr_t) v & ~EBR_PRIME_BIT);
+    // we can now move the value into the new table
+    if (v != NULL) {
+        v = NBHM_FN(put_if_match)(new_table, k, v, NULL);
+    }
+
+    // TODO(NeGate): we can replace the PRIME entry with a TOMBPRIME now that we've migrated it up.
+    // ...
+
+    return v;
+}
+
 NBHM_Table* NBHM_FN(move_items)(NBHM* hm, NBHM_Table* top_table, NBHM_Table* old_table, int items_to_move) {
     assert(old_table);
     size_t cap = old_table->cap;
@@ -263,40 +293,6 @@ NBHM_Table* NBHM_FN(move_items)(NBHM* hm, NBHM_Table* top_table, NBHM_Table* old
     }
 
     return old_table;
-}
-
-static void* NBHM_FN(migrate_item)(NBHM_Table* table, NBHM_Table* new_table, size_t i) {
-    // CAS key: NULL -> TOMBSTONE to stop entries from claiming the key
-    void* k = atomic_load_explicit(&table->data[i].key, memory_order_relaxed);
-    while (k == NULL && !atomic_compare_exchange_strong(&table->data[i].key, &k, &NBHM_TOMBSTONE)) {
-        // ...
-    }
-
-    if (k == NULL) {
-        return NULL;
-    }
-
-    // freeze the values by adding a prime bit.
-    void* v = atomic_load_explicit(&table->data[i].val, memory_order_relaxed);
-    while (((uintptr_t) v & NBHM_PRIME_BIT) == 0) {
-        uintptr_t primed_v = (v == &NBHM_TOMBSTONE ? 0 : (uintptr_t) v) | NBHM_PRIME_BIT;
-        if (atomic_compare_exchange_strong(&table->data[i].val, &v, (void*) primed_v)) {
-            break;
-        }
-        // btw, CAS updated v
-    }
-
-    // strip prime bit
-    v = (void*) ((uintptr_t) v & ~NBHM_PRIME_BIT);
-    // we can now move the value into the new table
-    if (v != NULL) {
-        v = NBHM_FN(put_if_match)(new_table, k, v, NULL);
-    }
-
-    // TODO(NeGate): we can replace the PRIME entry with a TOMBPRIME now that we've migrated it up.
-    // ...
-
-    return v;
 }
 
 static NBHM_Table* NBHM_FN(resize)(NBHM_Table* table, size_t limit) {
@@ -391,7 +387,7 @@ static void* NBHM_FN(put_if_match)(NBHM_Table* table, void* key, void* val, void
                 // and we should write to that later table. if not,
                 // we simply lost the race to update the value.
                 uintptr_t v_raw = (uintptr_t) v;
-                if (v_raw & NBHM_PRIME_BIT) {
+                if (v_raw & EBR_PRIME_BIT) {
                     continue;
                 }
             }
@@ -452,7 +448,7 @@ static void* NBHM_FN(raw_lookup)(NBHM_Table* table, uint32_t h, void* key) {
                 return NULL;
             } else if (NBHM_FN(cmp)(k, key)) {
                 // if we see a non-prime, then it's the latest revision
-                if (((uintptr_t) v & NBHM_PRIME_BIT) == 0) {
+                if (((uintptr_t) v & EBR_PRIME_BIT) == 0) {
                     return v != &NBHM_TOMBSTONE ? v : NULL;
                 }
 
@@ -515,3 +511,4 @@ void NBHM_FN(resize_barrier)(NBHM* hm) {
 
 #undef NBHM_FN
 #endif // NBHM_FN
+
