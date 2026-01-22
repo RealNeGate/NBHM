@@ -282,7 +282,7 @@ static NBHS_Table* NBHS_FN(resize)(NBHS_Table* table, size_t limit) {
         EBR_VIRTUAL_FREE(new_top, sizeof(NBHS_Table) + new_cap*sizeof(void*));
         return exp;
     } else {
-        // float s = sizeof(NBHS_Table) + new_cap*sizeof(NBHS_Entry);
+        // float s = sizeof(NBHS_Table) + new_cap*sizeof(void*);
         // printf("Resize: %.2f KiB (cap=%zu)\n", s / 1024.0f, new_cap);
         return new_top;
     }
@@ -313,8 +313,16 @@ static void* NBHS_FN(intern0)(NBHS_Table* table, void* val) {
             // fight for empty slot
             if (v == NULL && atomic_compare_exchange_strong(&table->data[i], &v, val)) {
                 atomic_fetch_add_explicit(&table->count, 1, memory_order_relaxed);
+
+                v = val;
                 found = true;
                 break;
+            }
+
+            // check for prime, if there's one we'll migrate up
+            if ((uintptr_t) v & EBR_PRIME_BIT) {
+                next = atomic_load_explicit(&table->next, memory_order_relaxed);
+                v = (void*) ((uintptr_t) v & ~EBR_PRIME_BIT);
             }
 
             if (NBHS_FN(cmp)(v, val)) {
@@ -333,6 +341,7 @@ static void* NBHS_FN(intern0)(NBHS_Table* table, void* val) {
         }
 
         // Migration barrier, freeze old entry before inserting to new table
+        assert(v != NULL);
         return next ? NBHS_FN(migrate_item)(table, next, i) : v;
     }
 }

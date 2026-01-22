@@ -50,6 +50,8 @@ void ebr_free(void* ptr, size_t size);
 
 #ifdef _WIN32
 #include <tlhelp32.h>
+#else
+#include <pthread.h>
 #endif
 
 #define EBR_DEBOOGING 0
@@ -112,13 +114,7 @@ static int ebr_thread_fn(void* arg) {
     EBR_FreeNode* last_free_list = NULL;
 
     #if EBR_DEBOOGING
-    #ifdef _WIN32
-    uint32_t tid = GetCurrentThreadId();
-    #else
-    uint32_t tid = pthread_self();
-    #endif
-
-    spall_auto_thread_init(tid, SPALL_DEFAULT_BUFFER_SIZE);
+    spall_auto_thread_init(37373737, SPALL_DEFAULT_BUFFER_SIZE);
     #endif
 
     ebr_running = true;

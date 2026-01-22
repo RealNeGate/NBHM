@@ -35,12 +35,30 @@ static bool my_cmp(const void* a, const void* b) {
     return x == y;
 }
 
+static uint32_t my2_hash(const void* a) {
+    uint32_t x = (uint32_t) (uintptr_t) a;
+    x = ((x >> 16) ^ x) * 0x45d9f3bU;
+    x = ((x >> 16) ^ x) * 0x45d9f3bU;
+    x = (x >> 16) ^ x;
+    return x;
+}
+
+static bool my2_cmp(const void* a, const void* b) {
+    uint32_t x = (uint32_t) (uintptr_t) a;
+    uint32_t y = (uint32_t) (uintptr_t) b;
+    return x == y;
+}
+
 #define EBR_IMPL
 #include "../ebr.h"
 
 #define NBHM_IMPL
 #define NBHM_FN(n) my_ ## n
 #include "../nbhm.h"
+
+#define NBHS_IMPL
+#define NBHS_FN(n) my2_ ## n
+#include "../nbhs.h"
 
 typedef struct {
     #ifdef _WIN32
