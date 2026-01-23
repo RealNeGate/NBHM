@@ -31,6 +31,16 @@
 #define EBR_REALLOC(ptr, size) realloc(ptr, size)
 #endif // EBR_REALLOC
 
+#define EBR_DEBOOGING 0
+
+#if EBR_DEBOOGING
+#define EBR__BEGIN(name)      spall_auto_buffer_begin(name, sizeof(name) - 1, NULL, 0)
+#define EBR__END()            spall_auto_buffer_end()
+#else
+#define EBR__BEGIN(name)
+#define EBR__END()
+#endif
+
 void ebr_init(void);
 void ebr_deinit(void);
 
@@ -52,16 +62,6 @@ void ebr_free(void* ptr, size_t size);
 #include <tlhelp32.h>
 #else
 #include <pthread.h>
-#endif
-
-#define EBR_DEBOOGING 0
-
-#if EBR_DEBOOGING
-#define EBR__BEGIN(name)      spall_auto_buffer_begin(name, sizeof(name) - 1, NULL, 0)
-#define EBR__END()            spall_auto_buffer_end()
-#else
-#define EBR__BEGIN(name)
-#define EBR__END()
 #endif
 
 typedef struct EBR_Entry EBR_Entry;
