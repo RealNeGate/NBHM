@@ -209,30 +209,6 @@ static size_t NBHS_FN(hash2index)(NBHS_Table* table, uint64_t u) {
 }
 
 static void* NBHS_FN(intern0)(NBHS_Table* table, void* val);
-static void* NBHS_FN(migrate_item)(NBHS_Table* table, NBHS_Table* new_table, size_t i) {
-    // freeze the values by adding a prime bit.
-    void* v = atomic_load_explicit(&table->data[i], memory_order_relaxed);
-    while (((uintptr_t) v & EBR_PRIME_BIT) == 0) {
-        uintptr_t primed_v = ((uintptr_t) v) | EBR_PRIME_BIT;
-        if (atomic_compare_exchange_strong(&table->data[i], &v, (void*) primed_v)) {
-            break;
-        }
-        // btw, CAS updated v
-    }
-
-    // strip prime bit
-    v = (void*) ((uintptr_t) v & ~EBR_PRIME_BIT);
-    // we can now move the value into the new table
-    if (v != NULL) {
-        v = NBHS_FN(intern0)(new_table, v);
-    }
-
-    // TODO(NeGate): we can replace the PRIME entry with a TOMBPRIME now that we've migrated it up.
-    // ...
-
-    return v;
-}
-
 NBHS_Table* NBHS_FN(move_items)(NBHS* hs, NBHS_Table* top_table, NBHS_Table* old_table, int items_to_move) {
     assert(old_table);
     size_t cap = old_table->cap;
@@ -253,7 +229,10 @@ NBHS_Table* NBHS_FN(move_items)(NBHS* hs, NBHS_Table* top_table, NBHS_Table* old
 
     EBR__BEGIN("copying old");
     for (size_t i = old; i < new; i++) {
-        NBHS_FN(migrate_item)(old_table, top_table, i);
+        void* v = atomic_load_explicit(&old_table->data[i], memory_order_acquire);
+        if (v != NULL) {
+            NBHS_FN(intern0)(top_table, v);
+        }
     }
     EBR__END();
 
@@ -319,12 +298,6 @@ static void* NBHS_FN(intern0)(NBHS_Table* table, void* val) {
                 break;
             }
 
-            // check for prime, if there's one we'll migrate up
-            if ((uintptr_t) v & EBR_PRIME_BIT) {
-                next = atomic_load_explicit(&table->next, memory_order_relaxed);
-                v = (void*) ((uintptr_t) v & ~EBR_PRIME_BIT);
-            }
-
             if (NBHS_FN(cmp)(v, val)) {
                 found = true;
                 break;
@@ -341,8 +314,7 @@ static void* NBHS_FN(intern0)(NBHS_Table* table, void* val) {
         }
 
         // Migration barrier, freeze old entry before inserting to new table
-        assert(v != NULL);
-        return next ? NBHS_FN(migrate_item)(table, next, i) : v;
+        return next ? NBHS_FN(intern0)(next, val) : v;
     }
 }
 

@@ -137,7 +137,7 @@ static uint64_t get_nanos(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-static uint32_t current_thread_id() {
+static uint32_t current_thread_id(void) {
     #if _WIN32
     return GetCurrentThreadId();
     #else

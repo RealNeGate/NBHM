@@ -101,7 +101,7 @@ static void ph_update(uint32_t key, Product p) {
 }
 
 enum { LINE_BUFFER_CAP = 2*1024*1024 };
-static char* line_buffer;
+static thread_local char* line_buffer;
 
 // You ready for some bullshit?
 // Skipping 8 characters at a time, searching for newlines!
@@ -159,6 +159,9 @@ static size_t skip_to_next(const char* str, size_t len, size_t i, size_t times, 
 
 // need to guarentee that it's safe to read 8bytes, the line buffer pads a bit just in case
 static uint64_t as_bits(size_t len, const char* str) {
+    if (len > 8) {
+        printf("ERROR: '%.*s'\n", (int)len, str);
+    }
     assert(len <= 8);
     uint64_t name;
     memcpy(&name, str, 8);
@@ -190,7 +193,6 @@ static int intcol(int target, size_t n, int* col_ptr, size_t* index) {
     return p;
 }
 
-static int good, bad;
 static uint64_t strcol(int target, size_t n, int* col_ptr, size_t* index) {
     int col = *col_ptr;
     assert(col <= target);
@@ -212,6 +214,13 @@ static uint64_t strcol(int target, size_t n, int* col_ptr, size_t* index) {
     return as_bits(col_len, &line_buffer[last_comma]);
 }
 
+static _Atomic uint64_t total_time;
+static uint64_t get_nanos(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
 static int process(void* arg) {
     const char* path = arg;
 
@@ -220,6 +229,7 @@ static int process(void* arg) {
     spall_auto_thread_init(++tid, SPALL_DEFAULT_BUFFER_SIZE);
     #endif
 
+    uint64_t start_time = get_nanos();
     line_buffer = malloc(LINE_BUFFER_CAP + 16);
 
     FILE* fp = fopen(path, "rb");
@@ -329,28 +339,34 @@ int main(int argc, char** argv) {
     product_table = nbhs_alloc(32);
 
     int num_threads = 4;
-    EBR__BEGIN("process");
-    thrd_t* arr = malloc(num_threads * sizeof(thrd_t));
-    for (int i = 0; i < num_threads; i++) {
-        thrd_create(&arr[i], process, argv[1]);
+    if (1) {
+        EBR__BEGIN("process");
+        thrd_t* arr = malloc(num_threads * sizeof(thrd_t));
+        for (int i = 0; i < num_threads; i++) {
+            thrd_create(&arr[i], process, argv[1]);
+        }
+        for (int i = 0; i < num_threads; i++) {
+            thrd_join(arr[i], NULL);
+        }
+        EBR__END();
+    } else {
+        for (int i = 0; i < num_threads; i++) {
+            process(argv[1]);
+        }
     }
-    for (int i = 0; i < num_threads; i++) {
-        thrd_join(arr[i], NULL);
-    }
-    EBR__END();
-
-    // process(argv[1]);
 
     // Collapse results
     my_resize_barrier(&product_table);
-    nbhs_for(e, &product_table) {
-        ProductEntry* p = *e;
-        char* name = (char*) &p->key;
-        double avg = (double) p->val.total / p->val.entries;
-        printf(
-            "%3s %d buy=%d sell=%d avg qty=%6.2f\n",
-            name, p->val.entries, p->val.buys, p->val.sells, avg
-        );
+    if (0) {
+        nbhs_for(e, &product_table) {
+            ProductEntry* p = *e;
+            char* name = (char*) &p->key;
+            double avg = (double) p->val.total / p->val.entries;
+            printf(
+                "%3s %d buy=%d sell=%d avg qty=%6.2f\n",
+                name, p->val.entries, p->val.buys, p->val.sells, avg
+            );
+        }
     }
 
     #if USE_SPALL
