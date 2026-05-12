@@ -299,6 +299,7 @@ static void* NBHS_FN(intern0)(NBHS_Table* table, void* val) {
             }
 
             if (NBHS_FN(cmp)(v, val)) {
+                val = v;
                 found = true;
                 break;
             }
