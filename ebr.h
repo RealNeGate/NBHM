@@ -64,6 +64,8 @@ void ebr_free(void* ptr, size_t size);
 #include <pthread.h>
 #endif
 
+#include <time.h>
+
 typedef struct EBR_Entry EBR_Entry;
 struct EBR_Entry {
     _Atomic(EBR_Entry*) next;
@@ -246,7 +248,8 @@ static int ebr_thread_fn(void* arg) {
         EBR__END();
 
         struct timespec w_time;
-        if (clock_gettime(CLOCK_REALTIME, &w_time) == 0) {
+        timespec_get(&w_time, TIME_UTC);
+        {
             w_time.tv_nsec += 500000000;
             if (w_time.tv_nsec >= 1000000000) {
                 w_time.tv_nsec -= 1000000000;
