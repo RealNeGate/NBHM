@@ -313,6 +313,7 @@ static NBHM_Table* NBHM_FN(resize)(NBHM_Table* table, size_t limit) {
     }
 }
 
+// returns the old value, or NULL if there was none
 static void* NBHM_FN(put_if_match)(NBHM_Table* table, void* key, void* val, void* exp) {
     assert(key);
 
@@ -344,7 +345,6 @@ static void* NBHM_FN(put_if_match)(NBHM_Table* table, void* key, void* val, void
 
                 // fight for empty slot
                 if (atomic_compare_exchange_strong(&table->data[i].key, &k, key)) {
-                    atomic_fetch_add_explicit(&table->count, 1, memory_order_relaxed);
                     found = true;
                     break;
                 }
@@ -367,7 +367,9 @@ static void* NBHM_FN(put_if_match)(NBHM_Table* table, void* key, void* val, void
 
         // Migration barrier, freeze old entry before inserting to new table
         if (next != NULL) {
-            return NBHM_FN(migrate_item)(table, next, i);
+            NBHM_FN(migrate_item)(table, next, i);
+            table = next;
+            continue;
         }
 
         // if the existing value is:
@@ -381,7 +383,7 @@ static void* NBHM_FN(put_if_match)(NBHM_Table* table, void* key, void* val, void
             // prime (thus the entry was migrated to a later table). It could also mean we lost
             // the insertion fight to another writer and in that case we'll take their value.
             if (atomic_compare_exchange_strong(&table->data[i].val, &v, val)) {
-                v = val;
+                atomic_fetch_add_explicit(&table->count, 1, memory_order_acq_rel);
             } else {
                 // if we see a prime, the entry has been migrated
                 // and we should write to that later table. if not,
