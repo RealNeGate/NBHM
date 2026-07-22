@@ -250,7 +250,7 @@ static int ebr_thread_fn(void* arg) {
         struct timespec w_time;
         timespec_get(&w_time, TIME_UTC);
         {
-            w_time.tv_nsec += 500000000;
+            w_time.tv_nsec += 10000000;
             if (w_time.tv_nsec >= 1000000000) {
                 w_time.tv_nsec -= 1000000000;
                 w_time.tv_sec += 1;

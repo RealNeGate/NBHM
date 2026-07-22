@@ -6,7 +6,8 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stdbool.h>
-#include <pthread.h>
+#include <threads.h>
+#include <inttypes.h>
 #include <stdatomic.h>
 
 #define USE_SPALL 0
@@ -19,99 +20,8 @@
 #define spall_auto_buffer_end(...)
 #endif
 
-static int num_threads;
-
-static uint32_t my_hash(const void* a) {
-    uint32_t x = (uint32_t) (uintptr_t) a;
-    x = ((x >> 16) ^ x) * 0x45d9f3bU;
-    x = ((x >> 16) ^ x) * 0x45d9f3bU;
-    x = (x >> 16) ^ x;
-    return x;
-}
-
-static bool my_cmp(const void* a, const void* b) {
-    uint32_t x = (uint32_t) (uintptr_t) a;
-    uint32_t y = (uint32_t) (uintptr_t) b;
-    return x == y;
-}
-
-static uint32_t my2_hash(const void* a) {
-    uint32_t x = (uint32_t) (uintptr_t) a;
-    x = ((x >> 16) ^ x) * 0x45d9f3bU;
-    x = ((x >> 16) ^ x) * 0x45d9f3bU;
-    x = (x >> 16) ^ x;
-    return x;
-}
-
-static bool my2_cmp(const void* a, const void* b) {
-    uint32_t x = (uint32_t) (uintptr_t) a;
-    uint32_t y = (uint32_t) (uintptr_t) b;
-    return x == y;
-}
-
 #define EBR_IMPL
 #include "../ebr.h"
-
-#define NBHM_IMPL
-#define NBHM_FN(n) my_ ## n
-#include "../nbhm.h"
-
-#define NBHS_IMPL
-#define NBHS_FN(n) my2_ ## n
-#include "../nbhs.h"
-
-typedef struct {
-    #ifdef _WIN32
-    CRITICAL_SECTION lock;
-    #else
-    pthread_mutex_t lock;
-    #endif
-
-    size_t exp;
-    void* data[];
-} LockedHS;
-
-void* lhs_intern(LockedHS* hs, void* val) {
-    EBR__BEGIN("intern");
-
-    if (num_threads > 1) {
-        #ifdef _WIN32
-        EnterCriticalSection(&hs->lock);
-        #else
-        pthread_mutex_lock(&hs->lock);
-        #endif
-    }
-
-    // actually lookup & insert
-    uint32_t exp = hs->exp;
-    size_t mask = (1 << exp) - 1;
-
-    void* result = NULL;
-    uint32_t h = my_hash(val);
-    size_t first = h & mask, i = first;
-    do {
-        if (hs->data[i] == NULL) {
-            hs->data[i] = result = val;
-            break;
-        } else if (my_cmp(hs->data[i], val)) {
-            result = hs->data[i];
-            break;
-        }
-        i = (i + 1) & mask;
-    } while (i != first);
-    assert(result != NULL);
-
-    if (num_threads > 1) {
-        #ifdef _WIN32
-        LeaveCriticalSection(&hs->lock);
-        #else
-        pthread_mutex_unlock(&hs->lock);
-        #endif
-    }
-
-    EBR__END();
-    return result;
-}
 
 // https://github.com/demetri/scribbles/blob/master/randomness/prngs.c
 uint32_t pcg32_pie(uint64_t *state) {
@@ -121,15 +31,6 @@ uint32_t pcg32_pie(uint64_t *state) {
     uint32_t rot = old >> 59u;
     return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
 }
-
-static LockedHS* test_lhs;
-static NBHM test_set;
-
-static int attempts; // per thread
-static bool testing_lhs;
-
-static int* thread_stats;
-static _Atomic uint64_t total_time;
 
 static uint64_t get_nanos(void) {
     struct timespec ts;
@@ -145,47 +46,61 @@ static uint32_t current_thread_id(void) {
     #endif
 }
 
-static int rounds;
-static int test_thread_fn(void* arg) {
-    uintptr_t starting_id = (uintptr_t) arg;
+typedef struct {
+    int local_id;
+    uint64_t total_time;
 
-    uint64_t full_id = (rounds*num_threads + starting_id + 1) << 56ull;
-    uint64_t seed    = full_id * 11400714819323198485ULL;
+    // local op counts
+    uint64_t ops[16];
 
-    int* stats = &thread_stats[starting_id*16];
-    stats[0] = stats[1] = 0;
+    // local histograms
+    uint64_t histo[256];
+} HarnessState;
 
-    // printf("Launched! %zu\n", 1+starting_id);
+static const char* OP_NAMES[16];
 
-    #if USE_SPALL
-    spall_auto_thread_init(1+starting_id, SPALL_DEFAULT_BUFFER_SIZE);
-    spall_auto_buffer_begin("work", 4, NULL, 0);
-    #endif
+// Run once (on one thread) before everything
+static void test_init(void);
+
+// All init_task() finish before run_task() begin
+static void test_init_task(HarnessState* state);
+
+// Actual test, part that's actually measured
+static void test_run_task(HarnessState* state);
+
+static void test_histo_put(HarnessState* state, int key) {
+    state->histo[key > 255 ? 255 : key] += 1;
+}
+
+static atomic_int threads_ready;
+static int num_threads;
+
+static int test_harness(void* arg) {
+    HarnessState* state = arg;
+
+    // barrier
+    ++threads_ready;
+    while (threads_ready != num_threads) {
+        thrd_yield();
+    }
 
     uint64_t start = get_nanos();
-    if (testing_lhs) {
-        abort();
-    } else {
-        for (size_t i = 0; i < attempts; i++) {
-            uintptr_t k = (uintptr_t) pcg32_pie(&seed) & 0x1FFFFF;
-            void* key = (void*) (k | full_id | (i << 32ull));
-            if (my_put_if_null(&test_set, key, key) == key) {
-                stats[0] += 1; // insertions
-            } else {
-                stats[1] += 1; // duplicate
-            }
-        }
-    }
-    total_time += get_nanos() - start;
-
-    #if USE_SPALL
-    spall_auto_buffer_end();
-    spall_auto_thread_quit();
-    #endif
-
+    test_run_task(state);
+    state->total_time += get_nanos() - start;
     return 0;
 }
 
+/* #if USE_SPALL
+spall_auto_thread_init(1+starting_id, SPALL_DEFAULT_BUFFER_SIZE);
+spall_auto_buffer_begin("work", 4, NULL, 0);
+#endif
+
+#if USE_SPALL
+spall_auto_buffer_end();
+spall_auto_thread_quit();
+#endif */
+
+static _Atomic int histo[256*16];
 int main(int argc, char** argv) {
     #if USE_SPALL
     spall_auto_init((char *)"profile.spall");
@@ -193,70 +108,61 @@ int main(int argc, char** argv) {
     #endif
 
     num_threads = atoi(argv[1]);
-    // printf("Testing with %d threads\n", num_threads);
+    test_init();
 
-    if (argc >= 3 && strcmp(argv[2], "lhs") == 0) {
-        testing_lhs = true;
-        printf("  With Locked hashset...\n");
-    }
+    thrd_t* arr = malloc(num_threads * sizeof(thrd_t));
+    HarnessState* harness = malloc(num_threads * sizeof(HarnessState));
 
-    attempts     = 16000000 / num_threads;
-    thread_stats = calloc(num_threads, 64 * sizeof(int));
-
-    if (testing_lhs) {
-        test_lhs = calloc(sizeof(LockedHS) + 262144*sizeof(void*), 1);
-        test_lhs->exp = 18;
-
-        #ifdef _WIN32
-        InitializeCriticalSection(&test_lhs->lock);
-        #endif
-    } else {
-        test_set = nbhm_alloc(32);
-
-        /* printf("Example!\n");
-
-        void* key;
-        key = (void*) (16ull | (2ull << 32ull));
-        printf("A %p\n", my_put_if_null(&test_set, key, key));
-
-        key = (void*) (16ull | (1ull << 32ull));
-        printf("B %p\n", my_put_if_null(&test_set, key, key));
-        return 0; */
-    }
-
-    for (int j = 0; j < 10; j++) {
-        total_time = 0;
-        thrd_t* arr = malloc(num_threads * sizeof(thrd_t));
-        for (int i = 0; i < num_threads; i++) {
-            thrd_create(&arr[i], test_thread_fn, (void*) (uintptr_t) i);
-        }
-        for (int i = 0; i < num_threads; i++) {
-            thrd_join(arr[i], NULL);
-        }
-
-        double ops = attempts * num_threads;
-        printf("%.4f ns/op (total=%.4f ms)\n", total_time / ops, total_time / 1000000.0);
-
-        int ins = 0, dup = 0;
-        for (int i = 0; i < num_threads; i++) {
-            ins += thread_stats[16*i];
-            dup += thread_stats[16*i + 1];
-        }
-        printf("  %d inserts, %d duplicates\n", ins, dup);
-        rounds++;
-    }
-
-    /* int inserted = 0, duplicates = 0;
+    uint64_t start = get_nanos();
     for (int i = 0; i < num_threads; i++) {
-        inserted   += thread_stats[i*16 + 0];
-        duplicates += thread_stats[i*16 + 1];
+        harness[i] = (HarnessState){ .local_id = i };
+        thrd_create(&arr[i], test_harness, &harness[i]);
     }
 
-    printf("%d + %d = %d (needed %d)\n", inserted, duplicates, inserted + duplicates, attempts*num_threads);
-    if (inserted + duplicates != attempts*num_threads) {
-        printf("FAIL!\n");
-        abort();
-    }*/
+    for (int i = 0; i < num_threads; i++) {
+        thrd_join(arr[i], NULL);
+    }
+    // uint64_t st_time = get_nanos() - start;
+
+    uint64_t st_time = 0;
+    for (int i = 0; i < num_threads; i++) {
+        st_time += harness[i].total_time;
+    }
+    st_time /= num_threads;
+
+    for (int i = 0; i < 256; i++) {
+        if (histo[i*16]) { printf("%d;%d\n", i, histo[i*16]); }
+    }
+
+    // dump histogram
+    printf("\nHISTOGRAM!\n");
+    for (int j = 0; j < 256; j++) {
+        uint64_t sum = 0;
+        for (int i = 0; i < num_threads; i++) {
+            sum += harness[i].histo[j];
+        }
+
+        if (sum) {
+            printf("%d;%"PRIu64"\n", j, sum);
+        }
+    }
+    printf("\n\n");
+
+    double total_secs  = st_time / 1000000000.0;
+    uint64_t total_ops = 0;
+    for (int j = 0; j < 16; j++) {
+        if (OP_NAMES[j] == NULL) {
+            continue;
+        }
+
+        uint64_t ops = 0;
+        for (int i = 0; i < num_threads; i++) {
+            ops += harness[i].ops[j];
+        }
+        printf("[%-15s] %10zu ops\n", OP_NAMES[j], ops);
+        total_ops += ops;
+    }
+    printf("[%-15s] %.4f ns/op (total=%.4f ms), %.4f Mops/s (%.4f Mops)\n", "TOTAL", st_time / (double) total_ops, st_time / 1000000.0, (total_ops / total_secs) / 1000000.0, total_ops / 1000000.0);
 
     #if USE_SPALL
     spall_auto_thread_quit();
@@ -265,6 +171,12 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+
+#if 1
+#include "inserts.h"
+#else
+#include "lru.h"
+#endif
 
 #if USE_SPALL
 #define SPALL_AUTO_IMPLEMENTATION
