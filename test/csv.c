@@ -363,9 +363,9 @@ int main(int argc, char** argv) {
             char* name = (char*) &p->key;
             double avg = (double) p->val.total / p->val.entries;
             printf(
-                "%3s %d buy=%d sell=%d avg qty=%6.2f\n",
-                name, p->val.entries, p->val.buys, p->val.sells, avg
-            );
+                   "%3s %d buy=%d sell=%d avg qty=%6.2f\n",
+                   name, p->val.entries, p->val.buys, p->val.sells, avg
+                   );
         }
     }
 

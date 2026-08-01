@@ -78,6 +78,10 @@ static int num_threads;
 static int test_harness(void* arg) {
     HarnessState* state = arg;
 
+    #if USE_SPALL
+    spall_auto_thread_init(state->local_id, SPALL_DEFAULT_BUFFER_SIZE);
+    #endif
+
     // barrier
     ++threads_ready;
     while (threads_ready != num_threads) {
@@ -87,6 +91,10 @@ static int test_harness(void* arg) {
     uint64_t start = get_nanos();
     test_run_task(state);
     state->total_time += get_nanos() - start;
+
+    #if USE_SPALL
+    spall_auto_thread_quit();
+    #endif
     return 0;
 }
 
@@ -106,6 +114,13 @@ int main(int argc, char** argv) {
     spall_auto_init((char *)"profile.spall");
     spall_auto_thread_init(0, SPALL_DEFAULT_BUFFER_SIZE);
     #endif
+
+    /*uint64_t start_n = get_nanos();
+    uint64_t start_m = __rdtsc();
+    thrd_sleep(&(struct timespec){.tv_sec=1}, NULL);
+    uint64_t dt_m = __rdtsc() - start_m;
+    uint64_t dt_n = get_nanos() - start_n;
+    printf("TSC freq %lu %lu %lu\n", dt_m, dt_n, dt_m / dt_n);*/
 
     num_threads = atoi(argv[1]);
     test_init();
@@ -128,8 +143,10 @@ int main(int argc, char** argv) {
     for (int i = 0; i < num_threads; i++) {
         st_time += harness[i].total_time;
     }
+    uint64_t cpu_time = st_time;
     st_time /= num_threads;
 
+    #if 0
     for (int i = 0; i < 256; i++) {
         if (histo[i*16]) { printf("%d;%d\n", i, histo[i*16]); }
     }
@@ -162,7 +179,24 @@ int main(int argc, char** argv) {
         printf("[%-15s] %10zu ops\n", OP_NAMES[j], ops);
         total_ops += ops;
     }
-    printf("[%-15s] %.4f ns/op (total=%.4f ms), %.4f Mops/s (%.4f Mops)\n", "TOTAL", st_time / (double) total_ops, st_time / 1000000.0, (total_ops / total_secs) / 1000000.0, total_ops / 1000000.0);
+    printf("[%-15s] %.4f ns/op (total=%.4f ms), %.4f Mops/s (%.4f Mops)\n", "TOTAL", cpu_time / (double) total_ops, st_time / 1000000.0, (total_ops / total_secs) / 1000000.0, total_ops / 1000000.0);
+    #else
+    double total_secs  = st_time / 1000000000.0;
+    uint64_t total_ops = 0;
+    for (int j = 0; j < 16; j++) {
+        if (OP_NAMES[j] == NULL) {
+            continue;
+        }
+
+        uint64_t ops = 0;
+        for (int i = 0; i < num_threads; i++) {
+            ops += harness[i].ops[j];
+        }
+        total_ops += ops;
+    }
+    // printf("%d;%.4f\n", num_threads, cpu_time / (double) total_ops);
+    printf("%d;%.4f\n", num_threads, (total_ops / total_secs) / 1000000.0);
+    #endif
 
     #if USE_SPALL
     spall_auto_thread_quit();
@@ -173,7 +207,8 @@ int main(int argc, char** argv) {
 }
 
 #if 1
-#include "inserts.h"
+// #include "inserts.h"
+#include "cache.h"
 #else
 #include "lru.h"
 #endif

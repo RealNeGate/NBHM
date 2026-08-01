@@ -41,6 +41,9 @@
 #define EBR__END()
 #endif
 
+// Used by NBHM_Counters
+extern _Thread_local uint64_t ebr_thread_id;
+
 void ebr_init(void);
 void ebr_deinit(void);
 
@@ -48,7 +51,7 @@ void ebr_deinit(void);
 void ebr_enter_cs(void);
 void ebr_exit_cs(void);
 
-void ebr_free(void* ptr, size_t size);
+void ebr_free(void* ptr, size_t size, bool is_heap);
 
 #endif // EBR_H
 
@@ -85,10 +88,15 @@ struct EBR_Entry {
 typedef struct EBR_FreeNode EBR_FreeNode;
 struct EBR_FreeNode {
     EBR_FreeNode* next;
+
     // space to reclaim
+    bool is_heap;
     void* ptr;
     size_t size;
 };
+
+static _Atomic uint64_t ebr_thread_counter;
+_Thread_local uint64_t ebr_thread_id;
 
 static _Thread_local bool ebr_thread_init;
 static _Thread_local EBR_Entry* ebr_thread_entry;
@@ -176,7 +184,11 @@ static int ebr_thread_fn(void* arg) {
         // empty the free list, it's possible that the mutators are still watching it
         // so we can't free it until the next iteration.
         for (; free_list; free_list = free_list->next) {
-            EBR_VIRTUAL_FREE(free_list->ptr, free_list->size);
+            if (free_list->is_heap) {
+                (void) EBR_REALLOC(free_list->ptr, 0);
+            } else {
+                EBR_VIRTUAL_FREE(free_list->ptr, free_list->size);
+            }
             // printf("FREE %p %zu\n", free_list->ptr, free_list->size);
         }
         last_free_list = free_list;
@@ -281,8 +293,9 @@ void ebr_init(void) {
     call_once(&ebr_init_flag, ebr_once_init);
 }
 
-void ebr_free(void* ptr, size_t size) {
+void ebr_free(void* ptr, size_t size, bool is_heap) {
     EBR_FreeNode* node = EBR_REALLOC(NULL, sizeof(EBR_FreeNode));
+    node->is_heap = is_heap;
     node->ptr  = ptr;
     node->size = size;
 
@@ -296,6 +309,8 @@ void ebr_free(void* ptr, size_t size) {
 
 void ebr_enter_cs(void) {
     if (ebr_thread_entry == NULL) {
+        ebr_thread_id = ++ebr_thread_counter;
+
         EBR_Entry* new_node = EBR_REALLOC(NULL, sizeof(EBR_Entry));
         new_node->time = 0;
         #ifdef _WIN32
