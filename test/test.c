@@ -82,6 +82,8 @@ static int test_harness(void* arg) {
     spall_auto_thread_init(state->local_id, SPALL_DEFAULT_BUFFER_SIZE);
     #endif
 
+    test_init_task(state);
+
     // barrier
     ++threads_ready;
     while (threads_ready != num_threads) {
@@ -146,7 +148,7 @@ int main(int argc, char** argv) {
     uint64_t cpu_time = st_time;
     st_time /= num_threads;
 
-    #if 0
+    #if 1
     for (int i = 0; i < 256; i++) {
         if (histo[i*16]) { printf("%d;%d\n", i, histo[i*16]); }
     }
