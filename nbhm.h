@@ -143,6 +143,9 @@ static void* nbhm_tx_val(NBHM_Tx* tx) {
 NBHM nbhm_alloc(size_t initial_cap);
 NBHS nbhs_alloc(size_t initial_cap);
 
+void nbhm_free(NBHM* table);
+void nbhs_free(NBHS* table);
+
 typedef struct {
     NBHM_Table* table;
     size_t i;
@@ -156,10 +159,12 @@ typedef struct {
 #define NBHM_FOR(it, table) for (NBHM_Iter it = nbhm_iter(table); nbhm_iter_next(&(it));)
 #define NBHS_FOR(it, table) for (NBHM_Iter it = nbhs_iter(table); nbhs_iter_next(&(it));)
 
-NBHM_Iter nbhs_iter(NBHS* table);
 NBHM_Iter nbhm_iter(NBHM* table);
-bool nbhs_iter_next(NBHM_Iter* iter);
+NBHM_Iter nbhs_iter(NBHS* table);
 bool nbhm_iter_next(NBHM_Iter* iter);
+bool nbhs_iter_next(NBHM_Iter* iter);
+size_t nbhm_UNSAFE_count(NBHM* table);
+size_t nbhs_UNSAFE_count(NBHS* table);
 
 #endif // NBHM_H
 
@@ -182,11 +187,16 @@ bool nbhm_iter_next(NBHM_Iter* iter);
 #define nbhm_cas_weak(a, b, c)   atomic_compare_exchange_weak_explicit(a, b, c, memory_order_acq_rel, memory_order_acquire)
 #define nbhm_fetch_add(a, b)     atomic_fetch_add_explicit(a, b, memory_order_acq_rel)
 #endif
+
+void nbhm__counter_add(_Atomic(NBHM_Counter*)* dst, int delta);
+void nbhm__counter_free(NBHM_Counter* cnt);
+uint64_t nbhm__counter_get(NBHM_Counter* cnt);
+uint64_t nbhm__counter_estimate(NBHM_Counter* cnt);
 #endif
 
 #ifdef NBHM_IMPL
 // (X + Y) / Z = int(X/Z) + int(Y/Z) + (mod(X,Z) + mod(Y,Z)/Z
-static uint64_t negate__div128(uint64_t numhi, uint64_t numlo, uint64_t den, uint64_t* out_rem) {
+uint64_t negate__div128(uint64_t numhi, uint64_t numlo, uint64_t den, uint64_t* out_rem) {
     // https://github.com/ridiculousfish/libdivide/blob/master/libdivide.h (libdivide_128_div_64_to_64)
     //
     // We work in base 2**32.
@@ -313,6 +323,16 @@ NBHS nbhs_alloc(size_t initial_cap) {
 
 NBHM nbhm_alloc(size_t initial_cap) {
     return (NBHM){ nbhm__alloc_internal(initial_cap, sizeof(void*[2])) };
+}
+
+size_t nbhs_UNSAFE_count(NBHS* table) {
+    NBHM_Table* curr = nbhm_ldacq(&table->curr);
+    return nbhm__counter_get(curr->count);
+}
+
+size_t nbhm_UNSAFE_count(NBHM* table) {
+    NBHM_Table* curr = nbhm_ldacq(&table->curr);
+    return nbhm__counter_get(curr->count);
 }
 
 void nbhs_free(NBHS* table) { nbhm__free(table->curr, sizeof(void*)); }
@@ -474,12 +494,9 @@ uint64_t nbhm__counter_estimate(NBHM_Counter* cnt) {
 #ifdef NBHM_FN
 #include <x86intrin.h>
 
+size_t nbhm__hash2index(NBHM_Table* table, uint64_t u);
+size_t nbhm__compute_cap(size_t y, size_t entry_size);
 void nbhm__compute_size(NBHM_Table* table, size_t cap);
-
-void nbhm__counter_add(_Atomic(NBHM_Counter*)* dst, int delta);
-void nbhm__counter_free(NBHM_Counter* cnt);
-uint64_t nbhm__counter_get(NBHM_Counter* cnt);
-uint64_t nbhm__counter_estimate(NBHM_Counter* cnt);
 
 #ifdef NBHM_IS_SET
 #define NBHM_T NBHS
@@ -656,7 +673,12 @@ static NBHM_Tx NBHM_FN(tx_begin)(NBHM_Table* table, void* key, bool abort_if_nul
     size_t i = nbhm__hash2index(table, h);
     for (;;) {
         k = nbhm_ldacq(NBHM_K(table, i));
+
+        #ifdef NBHM_IS_SET
+        v = NULL;
+        #else
         v = nbhm_ldacq(NBHM_V(table, i));
+        #endif
 
         if (k == NULL) {
             // key was never in the table
@@ -822,12 +844,9 @@ void* NBHM_FN(intern)(NBHM_T* hm, void* key) {
 
     ebr_enter_cs();
     NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
-
-    // just insert, no care for the old value
     NBHM_Tx tx = NBHM_FN(tx_begin)(curr, key, false);
-    while (!NBHM_FN(tx_commit)(&tx, val, false));
-
     ebr_exit_cs();
+
     EBR__END();
     return tx.k ? tx.k : key;
 }
@@ -905,7 +924,7 @@ void* NBHM_FN(get)(NBHM_T* hm, void* key) {
 }
 
 // waits for all items to be moved up before continuing
-void NBHM_FN(resize_barrier)(NBHM* hm) {
+void NBHM_FN(resize_barrier)(NBHM_T* hm) {
     EBR__BEGIN("resize_barrier");
     ebr_enter_cs();
     for (;;) {
