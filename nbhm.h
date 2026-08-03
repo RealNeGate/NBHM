@@ -283,9 +283,11 @@ void nbhm__compute_size(NBHM_Table* table, size_t cap) {
     memset(table->slots, 0, counter_size);
     table->slots->length = 8;
 
-    table->count = EBR_REALLOC(NULL, counter_size);
-    memset(table->count, 0, counter_size);
-    table->count->length = 8;
+    if (table->count == NULL) {
+        table->count = EBR_REALLOC(NULL, counter_size);
+        memset(table->count, 0, counter_size);
+        table->count->length = 8;
+    }
 }
 
 size_t nbhm__compute_cap(size_t y, size_t entry_size) {
@@ -357,7 +359,7 @@ bool nbhs_iter_next(NBHM_Iter* iter) {
         }
         iter->k = k;
         iter->v = NULL;
-        iter->i += 1;
+        iter->i = i + 1;
         return true;
     }
     return false;
@@ -376,7 +378,7 @@ bool nbhm_iter_next(NBHM_Iter* iter) {
         }
         iter->k = k;
         iter->v = v;
-        iter->i += 1;
+        iter->i = i + 1;
         return true;
     }
     return false;
@@ -601,8 +603,8 @@ NBHM_Table* NBHM_FN(move_items)(NBHM_T* hm, NBHM_Table* top_table, NBHM_Table* o
         size_t entry_size = sizeof(void*[2]);
         #endif
 
-        nbhm__counter_free(old_table->slots);
-        nbhm__counter_free(old_table->count);
+        // nbhm__counter_free(old_table->slots);
+        // nbhm__counter_free(old_table->count);
         ebr_free(old_table, sizeof(NBHM_Table) + old_table->cap*entry_size, false);
         return top_table;
     }
@@ -635,8 +637,9 @@ static NBHM_Table* NBHM_FN(resize)(NBHM_Table* table, size_t limit) {
         new_cap = nbhm__compute_cap(limit * 3, entry_size);
     }
 
-    // make resized table, we'll amortize the moves upward
+    // make resized table, we'll amortize the moves upward.
     NBHM_Table* new_top = EBR_VIRTUAL_ALLOC(sizeof(NBHM_Table) + new_cap*entry_size);
+    new_top->count = table->count;
     nbhm__compute_size(new_top, new_cap);
 
     NBHM_Table* exp = NULL;
@@ -691,11 +694,15 @@ static NBHM_Tx NBHM_FN(tx_begin)(NBHM_Table* table, void* key, bool abort_if_nul
                 nbhm__counter_add(&table->slots, 1);
                 found = true;
                 k = key;
+
+                #ifdef NBHM_IS_SET
+                v = key;
+                #endif
                 break;
             }
         }
 
-        if (NBHM_FN(cmp)(k, key)) {
+        if (k != NBHM_TOMBSTONE && (k == key || NBHM_FN(cmp)(k, key))) {
             found = true;
             break;
         }
@@ -794,7 +801,7 @@ static void* NBHM_FN(raw_lookup)(NBHM_Table* table, uint32_t h, void* key, void*
             (void) MC_REPORT_READ(key, prev_v);
             return (void*) ((uintptr_t) prev_v & ~EBR_PRIME_BIT);
         }
-        if (NBHM_FN(cmp)(k, key)) {
+        if (k != NBHM_TOMBSTONE && (k == key || NBHM_FN(cmp)(k, key))) {
             #ifdef NBHM_IS_SET
             return k;
             #else
@@ -845,10 +852,13 @@ void* NBHM_FN(intern)(NBHM_T* hm, void* key) {
     ebr_enter_cs();
     NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
     NBHM_Tx tx = NBHM_FN(tx_begin)(curr, key, false);
+    if (tx.v != NULL) {
+        nbhm__counter_add(&curr->count, 1);
+    }
     ebr_exit_cs();
 
     EBR__END();
-    return tx.k ? tx.k : key;
+    return tx.v ? key : tx.k;
 }
 #else
 void* NBHM_FN(put)(NBHM_T* hm, void* key, void* val) {
