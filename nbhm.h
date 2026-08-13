@@ -89,11 +89,15 @@ struct NBHM_Table {
     //
     // unfortunately this has to use nasty contention
     // but luckily not for very long.
-    alignas(64) _Atomic(uint64_t) moved;
-    alignas(64) _Atomic(uint64_t) move_done;
+    alignas(64) struct {
+        _Atomic(uint64_t) moved;
+        _Atomic(uint64_t) move_done;
+    };
 
     _Atomic(NBHM_Counter*) slots; // claimed slots
     _Atomic(NBHM_Counter*) count; // non-NULL values
+
+    _Atomic(uint32_t)* hashes;
 
     // KV[i] => [i*2 + 0], [i*2 + 1]
     // K[i]  => [i]
@@ -124,9 +128,15 @@ typedef struct {
 
     // current snapshot, you gotta use nbhm_tx_val to
     // unpack what "v" holds since there's special states.
+    uint32_t h;
     void* k;
     void* v;
 } NBHM_Tx;
+
+typedef struct {
+    void* k;
+    void* v;
+} NBHM_Entry;
 
 #define NBHM_TOMBSTONE ((void*) 1)
 
@@ -146,6 +156,9 @@ NBHS nbhs_alloc(size_t initial_cap);
 void nbhm_free(NBHM* table);
 void nbhs_free(NBHS* table);
 
+size_t nbhm_count(NBHM* table);
+size_t nbhs_count(NBHS* table);
+
 typedef struct {
     NBHM_Table* table;
     size_t i;
@@ -163,8 +176,6 @@ NBHM_Iter nbhm_iter(NBHM* table);
 NBHM_Iter nbhs_iter(NBHS* table);
 bool nbhm_iter_next(NBHM_Iter* iter);
 bool nbhs_iter_next(NBHM_Iter* iter);
-size_t nbhm_UNSAFE_count(NBHM* table);
-size_t nbhs_UNSAFE_count(NBHS* table);
 
 #endif // NBHM_H
 
@@ -288,6 +299,8 @@ void nbhm__compute_size(NBHM_Table* table, size_t cap) {
         memset(table->count, 0, counter_size);
         table->count->length = 8;
     }
+
+    table->hashes = EBR_VIRTUAL_ALLOC(cap * sizeof(uint32_t));
 }
 
 size_t nbhm__compute_cap(size_t y, size_t entry_size) {
@@ -308,6 +321,18 @@ static NBHM_Table* nbhm__alloc_internal(size_t initial_cap, size_t entry_size) {
     size_t cap = nbhm__compute_cap(initial_cap, entry_size);
     NBHM_Table* table = (NBHM_Table*) EBR_VIRTUAL_ALLOC(sizeof(NBHM_Table) + cap*entry_size);
     nbhm__compute_size(table, cap);
+
+    extern void cuikperf_region_start(const char* label, const char* extra);
+    extern void cuikperf_region_end(void);
+
+    cuikperf_region_start("pre-commit", NULL);
+    // poke 4K regions to force the pages to be resident now
+    size_t step = 4096 / entry_size, stride = entry_size / sizeof(void*);
+    for (size_t i = 0; i < cap; i += step) {
+        table->entries[i * stride] = NULL;
+    }
+    cuikperf_region_end();
+
     return table;
 }
 
@@ -327,12 +352,12 @@ NBHM nbhm_alloc(size_t initial_cap) {
     return (NBHM){ nbhm__alloc_internal(initial_cap, sizeof(void*[2])) };
 }
 
-size_t nbhs_UNSAFE_count(NBHS* table) {
+size_t nbhs_count(NBHS* table) {
     NBHM_Table* curr = nbhm_ldacq(&table->curr);
     return nbhm__counter_get(curr->count);
 }
 
-size_t nbhm_UNSAFE_count(NBHM* table) {
+size_t nbhm_count(NBHM* table) {
     NBHM_Table* curr = nbhm_ldacq(&table->curr);
     return nbhm__counter_get(curr->count);
 }
@@ -511,10 +536,10 @@ void nbhm__compute_size(NBHM_Table* table, size_t cap);
 
 // static _Atomic int histo[256*16];
 
-static NBHM_Tx NBHM_FN(tx_begin)(NBHM_Table* table, void* key, bool abort_if_null);
+static NBHM_Tx NBHM_FN(tx__begin)(NBHM_Table* table, void* key, uint32_t hash, bool abort_if_null);
 
 #ifndef NBHM_IS_SET // NBHM only code
-static bool NBHM_FN(tx_commit)(NBHM_Tx* tx, void* val, bool migrate);
+static bool NBHM_FN(tx__commit)(NBHM_Tx* tx, void* val, bool migrate);
 #endif
 
 static void NBHM_FN(migrate_item)(NBHM_Table* table, NBHM_Table* new_table, size_t i) {
@@ -530,11 +555,16 @@ static void NBHM_FN(migrate_item)(NBHM_Table* table, NBHM_Table* new_table, size
         return;
     }
 
+    uint32_t h = nbhm_ldacq(&table->hashes[i]);
+    if (h == 0) {
+        h = NBHM_FN(hash)(k);
+    }
+
     #ifdef NBHM_IS_SET
     // Hashset doesn't allow removals so it doesn't need to CAS in the primes.
     // We just need to fence so that the key in the old table is inserted before
     // any further ops can be performed.
-    NBHM_FN(tx_begin)(new_table, k, false);
+    NBHM_FN(tx__begin)(new_table, k, h, false);
     #else
     // freeze the values by adding a prime bit.
     void* old_v = nbhm_ldacq(NBHM_V(table, i));
@@ -556,9 +586,11 @@ static void NBHM_FN(migrate_item)(NBHM_Table* table, NBHM_Table* new_table, size
     void* v = (void*) ((uintptr_t) old_v & ~EBR_PRIME_BIT);
     assert(v != NULL && v != NBHM_TOMBSTONE);
 
+    cuikperf_region_start("copy up", NULL);
     // insert if NULL
-    NBHM_Tx tx = NBHM_FN(tx_begin)(new_table, k, false);
-    while (tx.v == NULL && !NBHM_FN(tx_commit)(&tx, v, true));
+    NBHM_Tx tx = NBHM_FN(tx__begin)(new_table, k, h, false);
+    while (tx.v == NULL && !NBHM_FN(tx__commit)(&tx, v, true));
+    cuikperf_region_end();
 
     // TODO(NeGate): we can replace the PRIME entry with a TOMBPRIME now that we've migrated it up.
     // ...
@@ -605,6 +637,7 @@ NBHM_Table* NBHM_FN(move_items)(NBHM_T* hm, NBHM_Table* top_table, NBHM_Table* o
 
         // nbhm__counter_free(old_table->slots);
         // nbhm__counter_free(old_table->count);
+        ebr_free(old_table->hashes, old_table->cap*sizeof(uint32_t), false);
         ebr_free(old_table, sizeof(NBHM_Table) + old_table->cap*entry_size, false);
         return top_table;
     }
@@ -656,9 +689,8 @@ static NBHM_Table* NBHM_FN(resize)(NBHM_Table* table, size_t limit) {
 // if abort_if_null is true, we'll end the transaction prematurely in case
 // there's an empty key slot (this is used for HM removal). In all other cases
 // the transaction shall produce a non-NULL key.
-static NBHM_Tx NBHM_FN(tx_begin)(NBHM_Table* table, void* key, bool abort_if_null) {
+static NBHM_Tx NBHM_FN(tx__begin)(NBHM_Table* table, void* key, uint32_t hash, bool abort_if_null) {
     NBHM_Tx tx = { 0 };
-    uint32_t h = NBHM_FN(hash)(key);
 
     void *k, *v;
     uint32_t cap   = table->cap;
@@ -673,7 +705,7 @@ static NBHM_Tx NBHM_FN(tx_begin)(NBHM_Table* table, void* key, bool abort_if_nul
     //   goes).
     int probe = 1;
     bool found = false;
-    size_t i = nbhm__hash2index(table, h);
+    size_t i = nbhm__hash2index(table, hash);
     for (;;) {
         k = nbhm_ldacq(NBHM_K(table, i));
 
@@ -691,6 +723,9 @@ static NBHM_Tx NBHM_FN(tx_begin)(NBHM_Table* table, void* key, bool abort_if_nul
 
             // fight for empty slot
             if (nbhm_cas_strong(NBHM_K(table, i), &k, key)) {
+                // memoize for later transactions, lookups and resizes
+                nbhm_strel(&table->hashes[i], hash);
+
                 nbhm__counter_add(&table->slots, 1);
                 found = true;
                 k = key;
@@ -702,7 +737,8 @@ static NBHM_Tx NBHM_FN(tx_begin)(NBHM_Table* table, void* key, bool abort_if_nul
             }
         }
 
-        if (k != NBHM_TOMBSTONE && (k == key || NBHM_FN(cmp)(k, key))) {
+        uint32_t h = nbhm_ldacq(&table->hashes[i]);
+        if (k != NBHM_TOMBSTONE && (h == 0 || h == hash) && (k == key || NBHM_FN(cmp)(k, key))) {
             found = true;
             break;
         }
@@ -712,11 +748,11 @@ static NBHM_Tx NBHM_FN(tx_begin)(NBHM_Table* table, void* key, bool abort_if_nul
         // so we might as well use the new one.
         if (++probe >= probe_limit || k == NBHM_TOMBSTONE) {
             NBHM_Table* next = NBHM_FN(resize)(table, limit);
-            return NBHM_FN(tx_begin)(next, key, abort_if_null);
+            return NBHM_FN(tx__begin)(next, key, hash, abort_if_null);
         }
 
         // mask-step-index
-        i += (h >> shift) | 1;
+        i += (hash >> shift) | 1;
         while (i >= cap) { i -= cap; }
     }
 
@@ -725,6 +761,7 @@ static NBHM_Tx NBHM_FN(tx_begin)(NBHM_Table* table, void* key, bool abort_if_nul
     tx.i = i;
     tx.k = k;
     tx.v = v;
+    tx.h = hash;
     return tx;
 }
 
@@ -733,13 +770,13 @@ static NBHM_Tx NBHM_FN(tx_begin)(NBHM_Table* table, void* key, bool abort_if_nul
 //
 // Function is allowed to spuriously failed to match weak CAS semantics (allowing
 // for some really neat tricks, at least for me).
-static bool NBHM_FN(tx_commit)(NBHM_Tx* tx, void* val, bool migrate) {
+static bool NBHM_FN(tx__commit)(NBHM_Tx* tx, void* val, bool migrate) {
     NBHM_Table* table = tx->table;
     size_t i = tx->i;
     void* k  = tx->k;
     void* v  = tx->v;
 
-    // This would imply that we didn't claim a slot, maybe tx_begin
+    // This would imply that we didn't claim a slot, maybe tx__begin
     // was told to abort on NULL but the caller still called commit?
     assert(k != NULL);
 
@@ -752,7 +789,7 @@ static bool NBHM_FN(tx_commit)(NBHM_Tx* tx, void* val, bool migrate) {
         NBHM_FN(migrate_item)(table, next, i);
 
         // redo the transaction begin on the new table
-        *tx = NBHM_FN(tx_begin)(next, k, val == NULL);
+        *tx = NBHM_FN(tx__begin)(next, k, tx->h, val == NULL);
         return false;
     }
 
@@ -784,13 +821,13 @@ static bool NBHM_FN(tx_commit)(NBHM_Tx* tx, void* val, bool migrate) {
 #endif
 
 // for a hash-set this returns the key, for a hash-map it returns the value.
-static void* NBHM_FN(raw_lookup)(NBHM_Table* table, uint32_t h, void* key, void* prev_v) {
+static void* NBHM_FN(raw_lookup)(NBHM_Table* table, uint32_t hash, void* key, void* prev_v) {
     uint32_t cap   = table->cap;
     uint32_t shift = __builtin_clz(cap - 1);
     uint32_t probe_limit = NBHM_PROBE_MIN_LIMIT + (cap >> 10u);
 
     int probe  = 1;
-    uint32_t i = nbhm__hash2index(table, h);
+    uint32_t i = nbhm__hash2index(table, hash);
     for (;;) {
         void* k = nbhm_ldacq(NBHM_K(table, i));
         #ifndef NBHM_IS_SET
@@ -801,7 +838,8 @@ static void* NBHM_FN(raw_lookup)(NBHM_Table* table, uint32_t h, void* key, void*
             (void) MC_REPORT_READ(key, prev_v);
             return (void*) ((uintptr_t) prev_v & ~EBR_PRIME_BIT);
         }
-        if (k != NBHM_TOMBSTONE && (k == key || NBHM_FN(cmp)(k, key))) {
+        uint32_t h = nbhm_ldacq(&table->hashes[i]);
+        if (k != NBHM_TOMBSTONE && (h == 0 || h == hash) && (k == key || NBHM_FN(cmp)(k, key))) {
             #ifdef NBHM_IS_SET
             return k;
             #else
@@ -823,10 +861,10 @@ static void* NBHM_FN(raw_lookup)(NBHM_Table* table, uint32_t h, void* key, void*
         // because I'm evil.
         if (++probe >= probe_limit || k == NBHM_TOMBSTONE) {
             NBHM_Table* next = nbhm_ldacq(&table->next);
-            return next ? NBHM_FN(raw_lookup)(next, h, key, NULL) : MC_REPORT_READ(key, NULL);
+            return next ? NBHM_FN(raw_lookup)(next, hash, key, NULL) : MC_REPORT_READ(key, NULL);
         }
         // mask-step-index
-        i += (h >> shift) | 1;
+        i += (hash >> shift) | 1;
         while (i >= cap) { i -= cap; }
     }
 }
@@ -837,7 +875,9 @@ static NBHM_Table* NBHM_FN(coop_migrate)(NBHM_T* hm) {
     NBHM_Table* curr = nbhm_ldacq(&hm->curr);
     NBHM_Table* next = nbhm_ldacq(&curr->next);
     if (next != NULL) {
-        return NBHM_FN(move_items)(hm, next, curr, NBHM_MOVE_AMOUNT);
+        cuikperf_region_start("MIGRATE", NULL);
+        curr = NBHM_FN(move_items)(hm, next, curr, NBHM_MOVE_AMOUNT);
+        cuikperf_region_end();
     }
     return curr;
 }
@@ -851,7 +891,9 @@ void* NBHM_FN(intern)(NBHM_T* hm, void* key) {
 
     ebr_enter_cs();
     NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
-    NBHM_Tx tx = NBHM_FN(tx_begin)(curr, key, false);
+
+    uint32_t hash = NBHM_FN(hash)(key);
+    NBHM_Tx tx = NBHM_FN(tx__begin)(curr, key, hash, false);
     if (tx.v != NULL) {
         nbhm__counter_add(&curr->count, 1);
     }
@@ -872,8 +914,9 @@ void* NBHM_FN(put)(NBHM_T* hm, void* key, void* val) {
     NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
 
     // just insert, no care for the old value
-    NBHM_Tx tx = NBHM_FN(tx_begin)(curr, key, false);
-    while (!NBHM_FN(tx_commit)(&tx, val, false));
+    uint32_t hash = NBHM_FN(hash)(key);
+    NBHM_Tx tx = NBHM_FN(tx__begin)(curr, key, hash, false);
+    while (!NBHM_FN(tx__commit)(&tx, val, false));
 
     ebr_exit_cs();
     EBR__END();
@@ -890,30 +933,53 @@ void* NBHM_FN(remove)(NBHM_T* hm, void* key) {
     NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
 
     // replace value with tombstone if not already empty
-    NBHM_Tx tx = NBHM_FN(tx_begin)(curr, key, true);
-    while (nbhm_tx_val(&tx) != NULL && !NBHM_FN(tx_commit)(&tx, NBHM_TOMBSTONE, false));
+    uint32_t hash = NBHM_FN(hash)(key);
+    NBHM_Tx tx = NBHM_FN(tx__begin)(curr, key, hash, false);
+    while (nbhm_tx_val(&tx) != NULL && !NBHM_FN(tx__commit)(&tx, NBHM_TOMBSTONE, false));
 
     ebr_exit_cs();
     EBR__END();
     return nbhm_tx_val(&tx);
 }
 
-void* NBHM_FN(put_if_null)(NBHM_T* hm, void* key, void* val) {
-    EBR__BEGIN("put");
+NBHM_Entry NBHM_FN(put_if_null)(NBHM_T* hm, void* key, void* val) {
+    EBR__BEGIN("put_if_null");
     MC_REPORT_BEGIN();
 
     assert(key && key != NBHM_TOMBSTONE);
-    assert(val);
 
     ebr_enter_cs();
     NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
 
-    NBHM_Tx tx = NBHM_FN(tx_begin)(curr, key, false);
-    while (nbhm_tx_val(&tx) == NULL && !NBHM_FN(tx_commit)(&tx, val, false));
+    uint32_t hash = NBHM_FN(hash)(key);
+    NBHM_Tx tx = NBHM_FN(tx__begin)(curr, key, hash, false);
+    while (nbhm_tx_val(&tx) == NULL && !NBHM_FN(tx__commit)(&tx, val, false));
+    ebr_exit_cs();
 
+    EBR__END();
+    return (NBHM_Entry){ tx.k, nbhm_tx_val(&tx) };
+}
+
+NBHM_Tx NBHM_FN(tx_begin)(NBHM_T* hm, void* key, bool abort_if_null) {
+    EBR__BEGIN("TX");
+    MC_REPORT_BEGIN();
+
+    assert(key && key != NBHM_TOMBSTONE);
+
+    ebr_enter_cs();
+    NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
+    uint32_t hash = NBHM_FN(hash)(key);
+
+    return NBHM_FN(tx__begin)(curr, key, hash, false);
+}
+
+bool NBHM_FN(tx_commit)(NBHM_Tx* tx, void* val) {
+    return NBHM_FN(tx__commit)(tx, val, false);
+}
+
+void NBHM_FN(tx_end)(NBHM_T* hm) {
     ebr_exit_cs();
     EBR__END();
-    return nbhm_tx_val(&tx);
 }
 #endif
 
@@ -926,6 +992,20 @@ void* NBHM_FN(get)(NBHM_T* hm, void* key) {
     NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
 
     uint32_t h = NBHM_FN(hash)(key);
+    void* v = NBHM_FN(raw_lookup)(curr, h, key, NULL);
+
+    ebr_exit_cs();
+    EBR__END();
+    return v;
+}
+
+void* NBHM_FN(geth)(NBHM_T* hm, void* key, uint32_t h) {
+    EBR__BEGIN("get");
+    MC_REPORT_BEGIN();
+    assert(key && key != NBHM_TOMBSTONE);
+
+    ebr_enter_cs();
+    NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
     void* v = NBHM_FN(raw_lookup)(curr, h, key, NULL);
 
     ebr_exit_cs();
@@ -950,6 +1030,7 @@ void NBHM_FN(resize_barrier)(NBHM_T* hm) {
 // internal macros
 #undef NBHM_K
 #undef NBHM_V
+#undef NBHM_T
 
 #undef NBHM_IS_SET
 #undef NBHM_FN
