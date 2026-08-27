@@ -303,6 +303,11 @@ void nbhm__compute_size(NBHM_Table* table, size_t cap) {
     table->hashes = EBR_VIRTUAL_ALLOC(cap * sizeof(uint32_t));
 }
 
+size_t nbhm__compute_cap2(size_t y, size_t entry_size) {
+    size_t cap = 1ull << (64 - __builtin_clzll(y - 1));
+    return cap - (sizeof(NBHM_Table) / entry_size);
+}
+
 size_t nbhm__compute_cap(size_t y, size_t entry_size) {
     // minimum capacity
     if (y < 256) {
@@ -412,6 +417,11 @@ bool nbhm_iter_next(NBHM_Iter* iter) {
 size_t nbhm__hash2index(NBHM_Table* table, uint64_t u) {
     uint64_t v = table->a;
 
+    #if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+    __uint128_t xl = u, yl = v;
+    __uint128_t rl = xl * yl;
+    uint64_t q = ((uint64_t)(rl >> 64)) >> table->sh;
+    #else
     // Multiply high 64: Ripped, straight, from, Hacker's delight... mmm delight
     uint64_t u0 = u & 0xFFFFFFFF;
     uint64_t u1 = u >> 32;
@@ -423,6 +433,8 @@ size_t nbhm__hash2index(NBHM_Table* table, uint64_t u) {
     uint64_t w2 = (u1*v1) + (t >> 32);
     uint64_t hi = w2 + (w1 >> 32);
     uint64_t q  = hi >> table->sh;
+    #endif
+
     assert(q == u / table->cap);
 
     // Modulo from quotient
@@ -524,6 +536,7 @@ uint64_t nbhm__counter_estimate(NBHM_Counter* cnt) {
 size_t nbhm__hash2index(NBHM_Table* table, uint64_t u);
 size_t nbhm__compute_cap(size_t y, size_t entry_size);
 void nbhm__compute_size(NBHM_Table* table, size_t cap);
+size_t nbhm__compute_cap2(size_t y, size_t entry_size);
 
 #ifdef NBHM_IS_SET
 #define NBHM_T NBHS
@@ -586,7 +599,7 @@ static void NBHM_FN(migrate_item)(NBHM_Table* table, NBHM_Table* new_table, size
     void* v = (void*) ((uintptr_t) old_v & ~EBR_PRIME_BIT);
     assert(v != NULL && v != NBHM_TOMBSTONE);
 
-    cuikperf_region_start("copy up", NULL);
+    cuikperf_region_start("C", NULL);
     // insert if NULL
     NBHM_Tx tx = NBHM_FN(tx__begin)(new_table, k, h, false);
     while (tx.v == NULL && !NBHM_FN(tx__commit)(&tx, v, true));
@@ -665,9 +678,11 @@ static NBHM_Table* NBHM_FN(resize)(NBHM_Table* table, size_t limit) {
     // Only grow the size if we're actually needing more slots, sometimes
     // we just have a lot of tombstones from earlier key claims which have
     // gone unused.
+    size_t count = nbhm__counter_get(table->count);
     size_t new_cap = table->cap;
-    if (nbhm__counter_get(table->count) >= new_cap / 2) {
-        new_cap = nbhm__compute_cap(limit * 3, entry_size);
+    if (count >= new_cap / 2) {
+        int scale = count > 500000 ? 2 : 3;
+        new_cap = nbhm__compute_cap2(count * scale, entry_size);
     }
 
     // make resized table, we'll amortize the moves upward.
@@ -694,7 +709,7 @@ static NBHM_Tx NBHM_FN(tx__begin)(NBHM_Table* table, void* key, uint32_t hash, b
 
     void *k, *v;
     uint32_t cap   = table->cap;
-    uint32_t shift = __builtin_clz(cap - 1);
+    uint32_t shift = 28; // __builtin_clz(cap - 1) + 1;
     uint32_t limit = (cap * NBHM_LOAD_FACTOR) / 100;
     uint32_t probe_limit = NBHM_PROBE_MIN_LIMIT + (cap >> 10u);
 
@@ -725,8 +740,8 @@ static NBHM_Tx NBHM_FN(tx__begin)(NBHM_Table* table, void* key, uint32_t hash, b
             if (nbhm_cas_strong(NBHM_K(table, i), &k, key)) {
                 // memoize for later transactions, lookups and resizes
                 nbhm_strel(&table->hashes[i], hash);
-
                 nbhm__counter_add(&table->slots, 1);
+
                 found = true;
                 k = key;
 
@@ -797,7 +812,7 @@ static bool NBHM_FN(tx__commit)(NBHM_Tx* tx, void* val, bool migrate) {
     // a prime (thus the entry was migrated to a later table). It could also mean
     // we lost the insertion fight to another writer and in that case we'll take
     // their value.
-    if (v != val && !nbhm_cas_weak(NBHM_V(table, i), &v, val)) {
+    if (v != val && !nbhm_cas_strong(NBHM_V(table, i), &v, val)) {
         // update to the value of the winner
         tx->v = v;
         return false;
@@ -823,7 +838,7 @@ static bool NBHM_FN(tx__commit)(NBHM_Tx* tx, void* val, bool migrate) {
 // for a hash-set this returns the key, for a hash-map it returns the value.
 static void* NBHM_FN(raw_lookup)(NBHM_Table* table, uint32_t hash, void* key, void* prev_v) {
     uint32_t cap   = table->cap;
-    uint32_t shift = __builtin_clz(cap - 1);
+    uint32_t shift = 28; // __builtin_clz(cap - 1) + 1;
     uint32_t probe_limit = NBHM_PROBE_MIN_LIMIT + (cap >> 10u);
 
     int probe  = 1;
@@ -968,8 +983,8 @@ NBHM_Tx NBHM_FN(tx_begin)(NBHM_T* hm, void* key, bool abort_if_null) {
 
     ebr_enter_cs();
     NBHM_Table* curr = NBHM_FN(coop_migrate)(hm);
-    uint32_t hash = NBHM_FN(hash)(key);
 
+    uint32_t hash = NBHM_FN(hash)(key);
     return NBHM_FN(tx__begin)(curr, key, hash, false);
 }
 
